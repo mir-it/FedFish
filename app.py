@@ -3,11 +3,14 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
+from datetime import date, timedelta
 
 import config
 import queries
 from fishbowl_client import FishbowlClient, FishbowlError
 from fedex_client import FedexClient, FedexError
+from synapse_client import SynapseClient, SynapseConfig
+from uom_conversion import load_coverage_map_from_csv, normalize_uom, suggest_each_qty
 
 
 class App(tk.Tk):
@@ -281,6 +284,8 @@ class PalletDetailFrame(ttk.Frame):
         actions.pack(fill="x")
         self.quote_btn = ttk.Button(actions, text="Get FedEx Rates", command=self._get_rates)
         self.quote_btn.pack(side="left")
+        self.synapse_btn = ttk.Button(actions, text="Create Synapse Order", command=self._create_synapse_order)
+        self.synapse_btn.pack(side="left", padx=8)
         self.toggle_raw_btn = ttk.Button(actions, text="Show raw response", command=self._toggle_raw, state="disabled")
         self.toggle_raw_btn.pack(side="left", padx=8)
 
@@ -297,6 +302,8 @@ class PalletDetailFrame(ttk.Frame):
         self.raw_text = tk.Text(self.rates_frame, height=10, wrap="none")
         self._raw_visible = False
         self._last_response: dict | None = None
+        self._last_synapse_response: dict | None = None
+        self._last_synapse_payload: dict | None = None
 
     def on_show(self):
         num = self.app.current_ship_num
@@ -326,6 +333,8 @@ class PalletDetailFrame(ttk.Frame):
         self.toggle_raw_btn.config(state="disabled")
         self._hide_raw()
         self._last_response = None
+        self._last_synapse_response = None
+        self._last_synapse_payload = None
 
         self.app.set_status(f"Loading items for {num}...")
 
@@ -335,6 +344,9 @@ class PalletDetailFrame(ttk.Frame):
         def ok(rows):
             self.app.current_items = rows
             for r in rows:
+                item_num = str(r.get("item_num", "") or "")
+                if self._should_exclude_item(item_num):
+                    continue
                 self.item_tree.insert(
                     "", "end",
                     values=(r.get("item_num", ""), r.get("qty", ""), r.get("uom", ""), r.get("po_number", "")),
@@ -342,6 +354,225 @@ class PalletDetailFrame(ttk.Frame):
             self.app.set_status(f"Shipment {num}: {len(pallets)} pallets, {len(rows)} items.")
 
         self.app.run_async(do, ok)
+
+    def _create_synapse_order(self):
+        if not config.SYNAPSE_USERNAME or not config.SYNAPSE_PASSWORD:
+            messagebox.showerror(
+                "Synapse not configured",
+                "Set SYNAPSE_USERNAME and SYNAPSE_PASSWORD in your .env (and restart the app).",
+            )
+            return
+
+        if not self.app.current_items:
+            messagebox.showwarning("No items", "No items are loaded for this shipment yet.")
+            return
+
+        first = self.app.current_items[0]
+        po_number = str(first.get("po_number") or "").strip()
+        if not po_number:
+            messagebox.showerror("Missing PO", "This shipment has no PO number in Fishbowl.")
+            return
+
+        ship_to_name = str(first.get("ship_to_name") or "").strip() or "SHIP TO"
+        ship_to_address_1 = str(first.get("address_1") or "").strip()
+        ship_to_city = str(first.get("city") or "").strip()
+        ship_to_state = str(first.get("state") or "").strip()
+        ship_to_postal_code = str(first.get("zip") or "").strip()
+        if not all([ship_to_address_1, ship_to_city, ship_to_state, ship_to_postal_code]):
+            messagebox.showerror(
+                "Missing Ship-To",
+                "Fishbowl is missing one or more ship-to fields (address/city/state/zip) for this shipment.",
+            )
+            return
+
+        # Aggregate duplicate item lines (same item + uom).
+        aggregated: dict[tuple[str, str], float] = {}
+        for r in self.app.current_items:
+            item_num = str(r.get("item_num") or "").strip()
+            if self._should_exclude_item(item_num):
+                continue
+            uom = normalize_uom(str(r.get("uom") or ""))
+            qty = r.get("qty") or 0
+            if not item_num or not uom:
+                continue
+            try:
+                qty_f = float(qty)
+            except (TypeError, ValueError):
+                qty_f = 0.0
+            aggregated[(item_num, uom)] = aggregated.get((item_num, uom), 0.0) + qty_f
+
+        review_lines: list[dict] = []
+        for (item_num, uom), qty in aggregated.items():
+            if qty:
+                review_lines.append({"item": item_num, "fb_uom": uom, "fb_qty": qty})
+
+        reviewed = self._review_synapse_lines(review_lines)
+        if reviewed is None:
+            self.app.set_status("Synapse order cancelled.")
+            return
+
+        details = [
+            {
+                "item": r["item"],
+                "uom_entered": r["send_uom"],
+                "qty_entered": r["send_qty"],
+                "inventory_status": config.SYNAPSE_INVENTORY_STATUS,
+                "lot_number": r.get("lot_number", ""),
+            }
+            for r in reviewed
+        ]
+        if not details:
+            messagebox.showerror("No order lines", "Could not build any detail lines from Fishbowl items.")
+            return
+
+        # Date windows used by many warehouses for allocation.
+        ship_date = date.today()
+        cancel_after = ship_date + timedelta(days=max(config.SYNAPSE_CANCEL_AFTER_DAYS, 0))
+
+        order_data = {
+            "header": {
+                "func": "A",
+                "custid": config.SYNAPSE_CUSTID,
+                "po_number": po_number,
+                "reference": po_number,
+                "from_facility": config.SYNAPSE_FROM_FACILITY,
+                "to_facility": config.SYNAPSE_TO_FACILITY,
+                "carrier": config.SYNAPSE_CARRIER,
+                "shipment_terms": config.SYNAPSE_SHIPMENT_TERMS,
+                "ship_date": ship_date,
+                "appointment_date": ship_date,
+                "ship_not_before": ship_date,
+                "ship_no_later": ship_date,
+                "cancel_after": cancel_after,
+                "shipper_name": config.SHIPPER_NAME,
+                "shipper_address_1": config.SHIPPER_ADDRESS_1,
+                "shipper_city": config.SHIPPER_CITY,
+                "shipper_state": config.SHIPPER_STATE,
+                "shipper_postal_code": config.SHIPPER_ZIP,
+                "shipper_country_code": "USA" if (config.SHIPPER_COUNTRY or "").upper() in {"US", "USA"} else config.SHIPPER_COUNTRY,
+                "ship_to_name": ship_to_name,
+                "ship_to_address_1": ship_to_address_1,
+                "ship_to_city": ship_to_city,
+                "ship_to_state": ship_to_state,
+                "ship_to_postal_code": ship_to_postal_code,
+                "ship_to_country_code": "USA",
+            },
+            "details": details,
+        }
+
+        # If shipment terms are 3rd party, attach bill-to info (account + address).
+        if (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper() == "3RD":
+            order_data["header"].update(
+                {
+                    "bill_to_account": config.SYNAPSE_BILLTO_ACCOUNT,
+                    "bill_to_name": config.SYNAPSE_BILLTO_NAME,
+                    "bill_to_address_1": config.SYNAPSE_BILLTO_ADDRESS_1,
+                    "bill_to_address_2": config.SYNAPSE_BILLTO_ADDRESS_2,
+                    "bill_to_city": config.SYNAPSE_BILLTO_CITY,
+                    "bill_to_state": config.SYNAPSE_BILLTO_STATE,
+                    "bill_to_postal_code": config.SYNAPSE_BILLTO_POSTAL_CODE,
+                    "bill_to_country_code": config.SYNAPSE_BILLTO_COUNTRY_CODE,
+                }
+            )
+
+        self._last_synapse_payload = order_data
+        self.synapse_btn.config(state="disabled")
+        self.app.set_status("Creating Synapse order...")
+
+        def do():
+            client = SynapseClient(
+                SynapseConfig(
+                    base_url=config.SYNAPSE_BASE_URL,
+                    username=config.SYNAPSE_USERNAME,
+                    password=config.SYNAPSE_PASSWORD,
+                )
+            )
+            client.login()
+            return client.create_order(order_data)
+
+        def ok(resp):
+            self.synapse_btn.config(state="normal")
+            self._last_synapse_response = resp
+            self.toggle_raw_btn.config(state="normal")
+            self.app.set_status("Synapse order created.")
+            messagebox.showinfo("Synapse", "Order created successfully in Synapse.")
+
+        def err(e):
+            self.synapse_btn.config(state="normal")
+            self._last_synapse_response = {"error": str(e)}
+            self.toggle_raw_btn.config(state="normal")
+            messagebox.showerror("Synapse error", str(e))
+            self.app.set_status("Synapse order creation failed.")
+
+        self.app.run_async(do, ok, err)
+
+    def _should_exclude_item(self, item_num: str) -> bool:
+        s = (item_num or "").strip().lower()
+        if not s:
+            return True
+        keywords = [k.strip().lower() for k in (config.EXCLUDE_ITEM_KEYWORDS or "").split(",") if k.strip()]
+        return any(k in s for k in keywords)
+
+    def _review_synapse_lines(self, lines: list[dict]) -> list[dict] | None:
+        coverage_map = {}
+        if config.PRODUCT_COVERAGE_CSV:
+            try:
+                coverage_map = load_coverage_map_from_csv(config.PRODUCT_COVERAGE_CSV)
+            except Exception as e:
+                messagebox.showwarning(
+                    "Coverage file not loaded",
+                    f"Could not load PRODUCT_COVERAGE_CSV.\n\n{e}\n\nYou'll need to override quantities manually.",
+                )
+
+        rows: list[dict] = []
+        for l in lines:
+            item = l["item"]
+            item_key = item.upper()
+            fb_uom = normalize_uom(l.get("fb_uom", ""))
+            fb_qty = float(l.get("fb_qty") or 0)
+            cov = coverage_map.get(item_key).coverage_sf_per_ea if item_key in coverage_map else None
+
+            send_uom = "EA"
+            send_qty = None
+            note = ""
+
+            if fb_uom == "SF" and cov:
+                send_qty, fractional = suggest_each_qty(fb_qty, cov)
+                if fractional:
+                    note = "SF→EA rounded up"
+                else:
+                    note = "SF→EA converted"
+            elif fb_uom == "SF" and not cov:
+                note = "No coverage found"
+            elif fb_uom in {"EA", "PCS"}:
+                send_uom = "EA"
+                send_qty = int(fb_qty) if float(fb_qty).is_integer() else None
+                if send_qty is None:
+                    note = "Needs integer"
+            elif fb_uom == "BOX":
+                send_uom = "BOX"
+                send_qty = int(fb_qty) if float(fb_qty).is_integer() else None
+                if send_qty is None:
+                    note = "Needs integer"
+            else:
+                note = "Review"
+
+            rows.append(
+                {
+                    "item": item,
+                    "fb_uom": fb_uom,
+                    "fb_qty": fb_qty,
+                    "coverage_sf_per_ea": cov,
+                    "send_uom": send_uom,
+                    "send_qty": send_qty,
+                    "lot_number": "",
+                    "note": note,
+                }
+            )
+
+        dlg = SynapseLinesDialog(self, rows)
+        self.wait_window(dlg)
+        return dlg.result
 
     def _get_rates(self):
         num = self.app.current_ship_num
@@ -405,12 +636,21 @@ class PalletDetailFrame(ttk.Frame):
             self._show_raw()
 
     def _show_raw(self):
-        if self._last_response is None:
+        if self._last_response is None and self._last_synapse_response is None:
             return
         self.rates_tree.pack_forget()
         self.raw_text.pack(fill="both", expand=True)
         self.raw_text.delete("1.0", "end")
-        self.raw_text.insert("1.0", json.dumps(self._last_response, indent=2))
+        if self._last_response is not None:
+            # FedEx mode
+            self.raw_text.insert("1.0", json.dumps(self._last_response, indent=2, default=str))
+        else:
+            # Synapse mode: show both request + response
+            bundle = {
+                "synapse_payload": self._last_synapse_payload,
+                "synapse_response": self._last_synapse_response,
+            }
+            self.raw_text.insert("1.0", json.dumps(bundle, indent=2, default=str))
         self.toggle_raw_btn.config(text="Show rate table")
         self._raw_visible = True
 
@@ -419,6 +659,168 @@ class PalletDetailFrame(ttk.Frame):
         self.rates_tree.pack(fill="both", expand=True)
         self.toggle_raw_btn.config(text="Show raw response")
         self._raw_visible = False
+
+
+class SynapseLinesDialog(tk.Toplevel):
+    def __init__(self, parent: ttk.Frame, rows: list[dict]):
+        super().__init__(parent)
+        self.title("Review Synapse Order Lines")
+        self.geometry("900x420")
+        self.resizable(True, True)
+        self.transient(parent.winfo_toplevel())
+        self.grab_set()
+
+        self.result: list[dict] | None = None
+        self._rows = rows
+
+        ttk.Label(
+            self,
+            text="Review and adjust the quantities that will be sent to Synapse.\n"
+            "Double-click Send Qty to edit. Qty must be an integer.",
+            justify="left",
+        ).pack(fill="x", padx=10, pady=(10, 6))
+
+        cols = ("item", "fb_qty", "fb_uom", "coverage", "send_qty", "send_uom", "lot", "note")
+        headers = ("Item", "FB Qty", "FB UOM", "SF per EA", "Send Qty", "Send UOM", "Lot #", "Note")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings")
+        for c, h in zip(cols, headers):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=120, anchor="w")
+        self.tree.column("item", width=160)
+        self.tree.column("note", width=170)
+        self.tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        for i, r in enumerate(self._rows):
+            cov = r.get("coverage_sf_per_ea")
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(i),
+                values=(
+                    r["item"],
+                    f"{r['fb_qty']:.3f}".rstrip("0").rstrip("."),
+                    r["fb_uom"],
+                    "" if cov is None else f"{cov:.3f}".rstrip("0").rstrip("."),
+                    "" if r.get("send_qty") is None else str(r["send_qty"]),
+                    r["send_uom"],
+                    r.get("lot_number", ""),
+                    r.get("note", ""),
+                ),
+            )
+
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right")
+        ttk.Button(btns, text="Send to Synapse", command=self._ok).pack(side="right", padx=(0, 8))
+
+    def _on_double_click(self, event):
+        row_id = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        if not row_id:
+            return
+        idx = int(row_id)
+        # #5 = send_qty, #7 = lot
+        if col == "#5":
+            current = self._rows[idx].get("send_qty")
+
+            win = tk.Toplevel(self)
+            win.title("Edit Send Qty")
+            win.transient(self)
+            win.grab_set()
+            ttk.Label(win, text=f"{self._rows[idx]['item']} send qty (integer):").pack(padx=10, pady=(10, 4))
+            var = tk.StringVar(value="" if current is None else str(current))
+            ent = ttk.Entry(win, textvariable=var, width=20)
+            ent.pack(padx=10, pady=(0, 10))
+            ent.focus_set()
+
+            def save():
+                s = var.get().strip()
+                try:
+                    v = int(s)
+                    if v <= 0:
+                        raise ValueError()
+                except Exception:
+                    messagebox.showerror("Invalid qty", "Send Qty must be a positive integer.", parent=win)
+                    return
+                self._rows[idx]["send_qty"] = v
+                self._refresh_row(idx)
+                win.destroy()
+
+            ttk.Button(win, text="Save", command=save).pack(padx=10, pady=(0, 10))
+            win.bind("<Return>", lambda e: save())
+            return
+
+        if col == "#7":
+            current_lot = self._rows[idx].get("lot_number", "")
+            win = tk.Toplevel(self)
+            win.title("Edit Lot Number")
+            win.transient(self)
+            win.grab_set()
+            ttk.Label(win, text=f"{self._rows[idx]['item']} lot number:").pack(padx=10, pady=(10, 4))
+            var = tk.StringVar(value=str(current_lot or ""))
+            ent = ttk.Entry(win, textvariable=var, width=30)
+            ent.pack(padx=10, pady=(0, 10))
+            ent.focus_set()
+
+            def save_lot():
+                self._rows[idx]["lot_number"] = var.get().strip()
+                self._refresh_row(idx)
+                win.destroy()
+
+            ttk.Button(win, text="Save", command=save_lot).pack(padx=10, pady=(0, 10))
+            win.bind("<Return>", lambda e: save_lot())
+
+    def _refresh_row(self, idx: int):
+        r = self._rows[idx]
+        cov = r.get("coverage_sf_per_ea")
+        self.tree.item(
+            str(idx),
+            values=(
+                r["item"],
+                f"{r['fb_qty']:.3f}".rstrip("0").rstrip("."),
+                r["fb_uom"],
+                "" if cov is None else f"{cov:.3f}".rstrip("0").rstrip("."),
+                "" if r.get("send_qty") is None else str(r["send_qty"]),
+                r["send_uom"],
+                r.get("lot_number", ""),
+                r.get("note", ""),
+            ),
+        )
+
+    def _ok(self):
+        out: list[dict] = []
+        for r in self._rows:
+            qty = r.get("send_qty")
+            if qty is None:
+                messagebox.showerror(
+                    "Missing qty",
+                    f"Missing Send Qty for item {r['item']}. Double-click the Send Qty cell to enter it.",
+                    parent=self,
+                )
+                return
+            if config.SYNAPSE_REQUIRE_LOT and not str(r.get("lot_number") or "").strip():
+                messagebox.showerror(
+                    "Missing lot number",
+                    f"Lot number is required for item {r['item']}. Double-click the Lot # cell to enter it.",
+                    parent=self,
+                )
+                return
+            out.append(
+                {
+                    "item": r["item"],
+                    "send_uom": r["send_uom"],
+                    "send_qty": qty,
+                    "lot_number": str(r.get("lot_number") or "").strip(),
+                }
+            )
+        self.result = out
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 if __name__ == "__main__":

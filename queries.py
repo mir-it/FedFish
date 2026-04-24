@@ -25,6 +25,7 @@ SHIPMENT_ITEMS_SQL_TEMPLATE = f"""
 SELECT
     ship.num AS ship_num,
     so.customerPO AS po_number,
+    ship.shipToName AS ship_to_name,
     ship.shipToAddress AS address_1,
     ship.shipToCity AS city,
     stateconst.code AS state,
