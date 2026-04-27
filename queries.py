@@ -51,3 +51,76 @@ ORDER BY product.num
 def items_sql_for(ship_num: str) -> str:
     safe = ship_num.replace("'", "''")
     return SHIPMENT_ITEMS_SQL_TEMPLATE.format(ship_num=safe)
+
+
+SHIP_SQL_TEMPLATE = """
+SELECT *
+FROM ship
+WHERE num = '{ship_num}'
+LIMIT 1
+"""
+
+
+SO_SQL_TEMPLATE = """
+SELECT *
+FROM so
+WHERE id = (
+    SELECT soId
+    FROM ship
+    WHERE num = '{ship_num}'
+    LIMIT 1
+)
+LIMIT 1
+"""
+
+
+CUSTOMER_SQL_TEMPLATE = """
+SELECT *
+FROM customer
+WHERE id = {customer_id}
+LIMIT 1
+"""
+
+
+LOT_CANDIDATES_SQL_TEMPLATE = """
+SELECT
+    product.num AS item_num,
+    tag.num AS tracking,
+    shipitem.qtyShipped AS qty_shipped
+FROM ship
+JOIN shipitem ON ship.id = shipitem.shipId
+JOIN product ON shipitem.productId = product.id
+LEFT JOIN tag ON shipitem.tagId = tag.id
+WHERE ship.num = '{ship_num}'
+"""
+
+
+STATE_CODE_SQL_TEMPLATE = """
+SELECT code
+FROM stateconst
+WHERE id = {state_id}
+LIMIT 1
+"""
+
+
+def ship_sql_for(ship_num: str) -> str:
+    safe = ship_num.replace("'", "''")
+    return SHIP_SQL_TEMPLATE.format(ship_num=safe)
+
+
+def so_sql_for(ship_num: str) -> str:
+    safe = ship_num.replace("'", "''")
+    return SO_SQL_TEMPLATE.format(ship_num=safe)
+
+
+def customer_sql_for(customer_id: int) -> str:
+    return CUSTOMER_SQL_TEMPLATE.format(customer_id=int(customer_id))
+
+
+def lot_candidates_sql_for(ship_num: str) -> str:
+    safe = ship_num.replace("'", "''")
+    return LOT_CANDIDATES_SQL_TEMPLATE.format(ship_num=safe)
+
+
+def state_code_sql_for(state_id: int) -> str:
+    return STATE_CODE_SQL_TEMPLATE.format(state_id=int(state_id))

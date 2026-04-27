@@ -159,11 +159,9 @@ class SynapseClient:
             "consignee",
             "shipper",
             # bill-to / 3rd party
-            "bill_to_account",
             "bill_to_name",
             "bill_to_contact",
             "bill_to_address_1",
-            "bill_to_address_2",
             "bill_to_city",
             "bill_to_state",
             "bill_to_postal_code",

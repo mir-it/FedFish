@@ -3,7 +3,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
 import config
 import queries
@@ -11,6 +11,55 @@ from fishbowl_client import FishbowlClient, FishbowlError
 from fedex_client import FedexClient, FedexError
 from synapse_client import SynapseClient, SynapseConfig
 from uom_conversion import load_coverage_map_from_csv, normalize_uom, suggest_each_qty
+
+
+def _row_get_any(row: dict | None, *keys: str):
+    if not row:
+        return None
+    lowered = {str(k).lower(): v for k, v in row.items()}
+    for key in keys:
+        k = key.lower()
+        if k in lowered and lowered[k] not in (None, ""):
+            return lowered[k]
+    return None
+
+
+def _to_boolish(value) -> bool:
+    s = str(value or "").strip().upper()
+    return s in {"Y", "YES", "TRUE", "1", "T"}
+
+
+def _parse_fb_date(value) -> date | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%m/%d/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _normalize_terms(raw: str) -> str:
+    s = (raw or "").strip()
+    u = s.upper().replace("-", "").replace(" ", "")
+    if u in {"3RD", "3RDPARTY", "THIRDPARTY", "THIRDPARTYBILL"}:
+        return "3RD"
+    return s.upper() if s else ""
+
+
+def _normalize_country(raw) -> str:
+    c = str(raw or "").strip().upper()
+    if not c:
+        return ""
+    return "USA" if c in {"US", "USA"} else c
 
 
 class App(tk.Tk):
@@ -31,6 +80,7 @@ class App(tk.Tk):
         self.shipments_by_num: dict[str, list[dict]] = {}
         self.current_ship_num: str | None = None
         self.current_items: list[dict] = []
+        self.current_order_context: dict = {}
 
         self.container = ttk.Frame(self)
         self.container.pack(fill="both", expand=True)
@@ -336,14 +386,19 @@ class PalletDetailFrame(ttk.Frame):
         self._last_response = None
         self._last_synapse_response = None
         self._last_synapse_payload = None
+        self.app.current_order_context = {}
 
         self.app.set_status(f"Loading items for {num}...")
 
         def do():
-            return self.app.fb.data_query(queries.items_sql_for(num))
+            rows = self.app.fb.data_query(queries.items_sql_for(num))
+            ctx = self._load_order_context(num)
+            return rows, ctx
 
-        def ok(rows):
+        def ok(payload):
+            rows, ctx = payload
             self.app.current_items = rows
+            self.app.current_order_context = ctx
             for r in rows:
                 item_num = str(r.get("item_num", "") or "")
                 if self._should_exclude_item(item_num):
@@ -362,6 +417,52 @@ class PalletDetailFrame(ttk.Frame):
 
         self.app.run_async(do, ok)
 
+    def _query_first(self, sql: str) -> dict:
+        try:
+            rows = self.app.fb.data_query(sql)
+        except Exception:
+            return {}
+        return rows[0] if rows else {}
+
+    def _state_code_from_id(self, state_id) -> str:
+        try:
+            state_int = int(str(state_id).strip())
+        except (TypeError, ValueError):
+            return ""
+        row = self._query_first(queries.state_code_sql_for(state_int))
+        return str(_row_get_any(row, "code") or "").strip()
+
+    def _build_lot_map(self, ship_num: str) -> dict[str, str]:
+        lot_map: dict[str, str] = {}
+        try:
+            rows = self.app.fb.data_query(queries.lot_candidates_sql_for(ship_num))
+        except Exception:
+            return lot_map
+        for r in rows:
+            item_num = str(r.get("item_num") or "").strip()
+            lot = str(r.get("tracking") or "").strip()
+            if item_num and lot and item_num not in lot_map:
+                lot_map[item_num] = lot
+        return lot_map
+
+    def _load_order_context(self, ship_num: str) -> dict:
+        ship_row = self._query_first(queries.ship_sql_for(ship_num))
+        so_row = self._query_first(queries.so_sql_for(ship_num))
+        customer_row = {}
+        customer_id = _row_get_any(so_row, "customerId", "customerid", "customer")
+        if customer_id not in (None, ""):
+            try:
+                customer_row = self._query_first(queries.customer_sql_for(int(customer_id)))
+            except Exception:
+                customer_row = {}
+        lot_by_item = self._build_lot_map(ship_num)
+        return {
+            "ship": ship_row,
+            "so": so_row,
+            "customer": customer_row,
+            "lot_by_item": lot_by_item,
+        }
+
     def _create_synapse_order(self):
         if not config.SYNAPSE_USERNAME or not config.SYNAPSE_PASSWORD:
             messagebox.showerror(
@@ -375,16 +476,31 @@ class PalletDetailFrame(ttk.Frame):
             return
 
         first = self.app.current_items[0]
+        ship_num = self.app.current_ship_num
+        ctx = self.app.current_order_context or {}
+        if ship_num and not ctx:
+            ctx = self._load_order_context(ship_num)
+            self.app.current_order_context = ctx
+        ship_row = ctx.get("ship", {}) or {}
+        so_row = ctx.get("so", {}) or {}
+        customer_row = ctx.get("customer", {}) or {}
+        lot_by_item = ctx.get("lot_by_item", {}) or {}
         po_number = str(first.get("po_number") or "").strip()
         if not po_number:
             messagebox.showerror("Missing PO", "This shipment has no PO number in Fishbowl.")
             return
 
-        ship_to_name = str(first.get("ship_to_name") or "").strip() or "SHIP TO"
-        ship_to_address_1 = str(first.get("address_1") or "").strip()
-        ship_to_city = str(first.get("city") or "").strip()
-        ship_to_state = str(first.get("state") or "").strip()
-        ship_to_postal_code = str(first.get("zip") or "").strip()
+        ship_to_name = str(
+            _row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or ""
+        ).strip() or "SHIP TO"
+        ship_to_address_1 = str(
+            _row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or ""
+        ).strip()
+        ship_to_city = str(_row_get_any(ship_row, "shipToCity") or first.get("city") or "").strip()
+        ship_to_state = str(_row_get_any(ship_row, "shipToState", "shipToStateId") or first.get("state") or "").strip()
+        ship_to_postal_code = str(
+            _row_get_any(ship_row, "shipToZip", "shipToPostalCode") or first.get("zip") or ""
+        ).strip()
         if not all([ship_to_address_1, ship_to_city, ship_to_state, ship_to_postal_code]):
             messagebox.showerror(
                 "Missing Ship-To",
@@ -399,6 +515,8 @@ class PalletDetailFrame(ttk.Frame):
             if self._should_exclude_item(item_num):
                 continue
             tracking = str(r.get("tracking") or "").strip()
+            if not tracking:
+                tracking = str(lot_by_item.get(item_num) or "").strip()
             uom = normalize_uom(str(r.get("uom") or ""))
             qty = r.get("qty") or 0
             if not item_num or not uom:
@@ -441,8 +559,68 @@ class PalletDetailFrame(ttk.Frame):
             return
 
         # Date windows used by many warehouses for allocation.
-        ship_date = date.today()
-        cancel_after = ship_date + timedelta(days=max(config.SYNAPSE_CANCEL_AFTER_DAYS, 0))
+        ship_date = (
+            _parse_fb_date(_row_get_any(ship_row, "dateCreated", "dateLastModified"))
+            or _parse_fb_date(_row_get_any(so_row, "dateCreated", "dateIssued", "dateCompleted"))
+            or date.today()
+        )
+        requested_ship = _parse_fb_date(
+            _row_get_any(so_row, "dateScheduledFulfillment", "dateFirstShip", "dateNeeded")
+        ) or ship_date
+        ship_no_later = _parse_fb_date(
+            _row_get_any(so_row, "dateLastFulfillment", "dateDue", "dateExpiration")
+        ) or requested_ship
+        cancel_after = _parse_fb_date(
+            _row_get_any(so_row, "dateExpiration", "dateExpires", "dateCompleted")
+        ) or (ship_date + timedelta(days=max(config.SYNAPSE_CANCEL_AFTER_DAYS, 0)))
+
+        shipment_terms = _normalize_terms(
+            str(
+                _row_get_any(
+                    so_row,
+                    "shipmentTerms",
+                    "shipTerms",
+                    "freightTerms",
+                    "termCode",
+                )
+                or ""
+            )
+        )
+        if not shipment_terms:
+            third_party_flag = _to_boolish(
+                _row_get_any(so_row, "isThirdParty", "thirdPartyBilling", "thirdParty")
+            )
+            shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
+
+        bill_to_name = str(
+            _row_get_any(so_row, "billToName")
+            or _row_get_any(customer_row, "name")
+            or config.SYNAPSE_BILLTO_NAME
+            or ""
+        ).strip()
+        bill_to_address_1 = str(
+            _row_get_any(so_row, "billToAddress", "billToAddress1")
+            or config.SYNAPSE_BILLTO_ADDRESS_1
+            or ""
+        ).strip()
+        bill_to_city = str(_row_get_any(so_row, "billToCity") or config.SYNAPSE_BILLTO_CITY or "").strip()
+        bill_to_state = str(_row_get_any(so_row, "billToState") or "").strip()
+        if not bill_to_state:
+            bill_to_state_id = _row_get_any(so_row, "billToStateId")
+            if bill_to_state_id not in (None, ""):
+                bill_to_state = self._state_code_from_id(bill_to_state_id)
+        if not bill_to_state:
+            bill_to_state = str(_row_get_any(customer_row, "state") or "").strip()
+        if not bill_to_state:
+            bill_to_state = str(config.SYNAPSE_BILLTO_STATE or "").strip()
+        bill_to_postal_code = str(
+            _row_get_any(so_row, "billToZip", "billToPostalCode") or config.SYNAPSE_BILLTO_POSTAL_CODE or ""
+        ).strip()
+        bill_to_country_code = _normalize_country(
+            _row_get_any(so_row, "billToCountry", "billToCountryCode")
+            or config.SYNAPSE_BILLTO_COUNTRY_CODE
+            or "USA"
+        )
 
         order_data = {
             "header": {
@@ -453,18 +631,19 @@ class PalletDetailFrame(ttk.Frame):
                 "from_facility": config.SYNAPSE_FROM_FACILITY,
                 "to_facility": config.SYNAPSE_TO_FACILITY,
                 "carrier": config.SYNAPSE_CARRIER,
-                "shipment_terms": config.SYNAPSE_SHIPMENT_TERMS,
+                "shipment_terms": shipment_terms or config.SYNAPSE_SHIPMENT_TERMS,
                 "ship_date": ship_date,
-                "appointment_date": ship_date,
-                "ship_not_before": ship_date,
-                "ship_no_later": ship_date,
+                "appointment_date": requested_ship,
+                "requested_ship": requested_ship,
+                "ship_not_before": requested_ship,
+                "ship_no_later": ship_no_later,
                 "cancel_after": cancel_after,
                 "shipper_name": config.SHIPPER_NAME,
                 "shipper_address_1": config.SHIPPER_ADDRESS_1,
                 "shipper_city": config.SHIPPER_CITY,
                 "shipper_state": config.SHIPPER_STATE,
                 "shipper_postal_code": config.SHIPPER_ZIP,
-                "shipper_country_code": "USA" if (config.SHIPPER_COUNTRY or "").upper() in {"US", "USA"} else config.SHIPPER_COUNTRY,
+                "shipper_country_code": _normalize_country(config.SHIPPER_COUNTRY),
                 "ship_to_name": ship_to_name,
                 "ship_to_address_1": ship_to_address_1,
                 "ship_to_city": ship_to_city,
@@ -476,17 +655,15 @@ class PalletDetailFrame(ttk.Frame):
         }
 
         # If shipment terms are 3rd party, attach bill-to info (account + address).
-        if (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper() == "3RD":
+        if (shipment_terms or config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper() == "3RD":
             order_data["header"].update(
                 {
-                    "bill_to_account": config.SYNAPSE_BILLTO_ACCOUNT,
-                    "bill_to_name": config.SYNAPSE_BILLTO_NAME,
-                    "bill_to_address_1": config.SYNAPSE_BILLTO_ADDRESS_1,
-                    "bill_to_address_2": config.SYNAPSE_BILLTO_ADDRESS_2,
-                    "bill_to_city": config.SYNAPSE_BILLTO_CITY,
-                    "bill_to_state": config.SYNAPSE_BILLTO_STATE,
-                    "bill_to_postal_code": config.SYNAPSE_BILLTO_POSTAL_CODE,
-                    "bill_to_country_code": config.SYNAPSE_BILLTO_COUNTRY_CODE,
+                    "bill_to_name": bill_to_name,
+                    "bill_to_address_1": bill_to_address_1,
+                    "bill_to_city": bill_to_city,
+                    "bill_to_state": bill_to_state,
+                    "bill_to_postal_code": bill_to_postal_code,
+                    "bill_to_country_code": bill_to_country_code,
                 }
             )
 
