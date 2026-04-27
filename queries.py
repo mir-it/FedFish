@@ -31,7 +31,20 @@ SELECT
     stateconst.code AS state,
     ship.shipToZip AS zip,
     product.num AS item_num,
-    '' AS tracking,
+    COALESCE(
+        (
+            SELECT ttv.info
+            FROM shipitem si
+            LEFT JOIN tagtrackingview ttv ON ttv.tagId = si.tagId
+            WHERE si.shipId = ship.id
+              AND si.soItemId = soitem.id
+              AND ttv.info IS NOT NULL
+              AND ttv.info <> ''
+            ORDER BY si.id
+            LIMIT 1
+        ),
+        ''
+    ) AS tracking,
     soitem.qtyOrdered AS qty,
     uom.code AS uom
 FROM ship
@@ -82,19 +95,6 @@ LIMIT 1
 """
 
 
-LOT_CANDIDATES_SQL_TEMPLATE = """
-SELECT
-    product.num AS item_num,
-    tag.num AS tracking,
-    shipitem.qtyShipped AS qty_shipped
-FROM ship
-JOIN shipitem ON ship.id = shipitem.shipId
-JOIN product ON shipitem.productId = product.id
-LEFT JOIN tag ON shipitem.tagId = tag.id
-WHERE ship.num = '{ship_num}'
-"""
-
-
 STATE_CODE_SQL_TEMPLATE = """
 SELECT code
 FROM stateconst
@@ -115,11 +115,6 @@ def so_sql_for(ship_num: str) -> str:
 
 def customer_sql_for(customer_id: int) -> str:
     return CUSTOMER_SQL_TEMPLATE.format(customer_id=int(customer_id))
-
-
-def lot_candidates_sql_for(ship_num: str) -> str:
-    safe = ship_num.replace("'", "''")
-    return LOT_CANDIDATES_SQL_TEMPLATE.format(ship_num=safe)
 
 
 def state_code_sql_for(state_id: int) -> str:

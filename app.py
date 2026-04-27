@@ -81,6 +81,7 @@ class App(tk.Tk):
         self.current_ship_num: str | None = None
         self.current_items: list[dict] = []
         self.current_order_context: dict = {}
+        self.synapse_sent_shipments: set[str] = set()
 
         self.container = ttk.Frame(self)
         self.container.pack(fill="both", expand=True)
@@ -226,12 +227,14 @@ class ShipmentsFrame(ttk.Frame):
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
-        cols = ("ship_num", "city", "state", "zip", "pallets", "total_weight")
-        headers = ("Ship #", "City", "State", "Zip", "Pallets", "Total Weight (lb)")
+        cols = ("ship_num", "city", "state", "zip", "pallets", "total_weight", "synapse_status")
+        headers = ("Ship #", "City", "State", "Zip", "Pallets", "Total Weight (lb)", "Synapse")
         self.tree = ttk.Treeview(self, columns=cols, show="headings")
         for c, h in zip(cols, headers):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=130, anchor="w")
+        self.tree.column("synapse_status", width=90, anchor="center")
+        self.tree.tag_configure("synapse_sent", background="#dff0d8")
         self.tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.tree.bind("<Double-1>", lambda e: self._view_selected())
 
@@ -270,11 +273,23 @@ class ShipmentsFrame(ttk.Frame):
                         first.get("zip", ""),
                         len(pallets),
                         f"{total_w:.1f}",
+                        "SENT" if num in self.app.synapse_sent_shipments else "",
                     ),
+                    tags=("synapse_sent",) if num in self.app.synapse_sent_shipments else (),
                 )
             self.app.set_status(f"Loaded {len(grouped)} shipments.")
 
         self.app.run_async(do, ok)
+
+    def mark_synapse_sent(self, ship_num: str):
+        self.app.synapse_sent_shipments.add(ship_num)
+        if not ship_num or not self.tree.exists(ship_num):
+            return
+        current_values = list(self.tree.item(ship_num, "values") or ())
+        if len(current_values) < 7:
+            current_values += [""] * (7 - len(current_values))
+        current_values[6] = "SENT"
+        self.tree.item(ship_num, values=tuple(current_values), tags=("synapse_sent",))
 
     def _view_selected(self):
         sel = self.tree.selection()
@@ -293,6 +308,7 @@ class ShipmentsFrame(ttk.Frame):
             self.app.fb = None
         self.tree.delete(*self.tree.get_children())
         self.app.shipments_by_num = {}
+        self.app.synapse_sent_shipments = set()
         self.app.show("login")
 
 
@@ -432,19 +448,6 @@ class PalletDetailFrame(ttk.Frame):
         row = self._query_first(queries.state_code_sql_for(state_int))
         return str(_row_get_any(row, "code") or "").strip()
 
-    def _build_lot_map(self, ship_num: str) -> dict[str, str]:
-        lot_map: dict[str, str] = {}
-        try:
-            rows = self.app.fb.data_query(queries.lot_candidates_sql_for(ship_num))
-        except Exception:
-            return lot_map
-        for r in rows:
-            item_num = str(r.get("item_num") or "").strip()
-            lot = str(r.get("tracking") or "").strip()
-            if item_num and lot and item_num not in lot_map:
-                lot_map[item_num] = lot
-        return lot_map
-
     def _load_order_context(self, ship_num: str) -> dict:
         ship_row = self._query_first(queries.ship_sql_for(ship_num))
         so_row = self._query_first(queries.so_sql_for(ship_num))
@@ -455,12 +458,10 @@ class PalletDetailFrame(ttk.Frame):
                 customer_row = self._query_first(queries.customer_sql_for(int(customer_id)))
             except Exception:
                 customer_row = {}
-        lot_by_item = self._build_lot_map(ship_num)
         return {
             "ship": ship_row,
             "so": so_row,
             "customer": customer_row,
-            "lot_by_item": lot_by_item,
         }
 
     def _create_synapse_order(self):
@@ -484,7 +485,6 @@ class PalletDetailFrame(ttk.Frame):
         ship_row = ctx.get("ship", {}) or {}
         so_row = ctx.get("so", {}) or {}
         customer_row = ctx.get("customer", {}) or {}
-        lot_by_item = ctx.get("lot_by_item", {}) or {}
         po_number = str(first.get("po_number") or "").strip()
         if not po_number:
             messagebox.showerror("Missing PO", "This shipment has no PO number in Fishbowl.")
@@ -493,6 +493,7 @@ class PalletDetailFrame(ttk.Frame):
         ship_to_name = str(
             _row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or ""
         ).strip() or "SHIP TO"
+        ship_to_name = ship_to_name[:40]
         ship_to_address_1 = str(
             _row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or ""
         ).strip()
@@ -515,8 +516,6 @@ class PalletDetailFrame(ttk.Frame):
             if self._should_exclude_item(item_num):
                 continue
             tracking = str(r.get("tracking") or "").strip()
-            if not tracking:
-                tracking = str(lot_by_item.get(item_num) or "").strip()
             uom = normalize_uom(str(r.get("uom") or ""))
             qty = r.get("qty") or 0
             if not item_num or not uom:
@@ -597,7 +596,7 @@ class PalletDetailFrame(ttk.Frame):
             or _row_get_any(customer_row, "name")
             or config.SYNAPSE_BILLTO_NAME
             or ""
-        ).strip()
+        ).strip()[:40]
         bill_to_address_1 = str(
             _row_get_any(so_row, "billToAddress", "billToAddress1")
             or config.SYNAPSE_BILLTO_ADDRESS_1
@@ -627,6 +626,7 @@ class PalletDetailFrame(ttk.Frame):
                 "func": "A",
                 "custid": config.SYNAPSE_CUSTID,
                 "po_number": po_number,
+                "order_type": "O",
                 "reference": po_number,
                 "from_facility": config.SYNAPSE_FROM_FACILITY,
                 "to_facility": config.SYNAPSE_TO_FACILITY,
@@ -686,6 +686,10 @@ class PalletDetailFrame(ttk.Frame):
             self.synapse_btn.config(state="normal")
             self._last_synapse_response = resp
             self.toggle_raw_btn.config(state="normal")
+            if self.app.current_ship_num:
+                shipments_frame = self.app.frames.get("shipments")
+                if isinstance(shipments_frame, ShipmentsFrame):
+                    shipments_frame.mark_synapse_sent(self.app.current_ship_num)
             self.app.set_status("Synapse order created.")
             messagebox.showinfo("Synapse", "Order created successfully in Synapse.")
 

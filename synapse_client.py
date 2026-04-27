@@ -106,7 +106,7 @@ class SynapseClient:
         if not from_facility:
             raise ValueError("header.from_facility is required")
 
-        ship_to_name = (hdr_in.get("ship_to_name") or "").strip()
+        ship_to_name = (hdr_in.get("ship_to_name") or "").strip()[:40]
         ship_to_address_1 = (hdr_in.get("ship_to_address_1") or "").strip()
         ship_to_city = (hdr_in.get("ship_to_city") or "").strip()
         ship_to_state = (hdr_in.get("ship_to_state") or "").strip()
@@ -124,7 +124,7 @@ class SynapseClient:
         header: dict[str, Any] = {
             "func": hdr_in.get("func", "A"),  # A=add (per your sheet: A/U/R/D)
             "custid": custid,
-            "order_type": hdr_in.get("order_type", "A"),
+            "order_type": "O",
             "appointment_date": _synapse_date(hdr_in.get("appointment_date")),
             "ship_date": _synapse_date(hdr_in.get("ship_date")),
             "po_number": po_number,
@@ -179,7 +179,10 @@ class SynapseClient:
                 if key in {"cancel_after", "requested_ship", "ship_not_before", "ship_no_later"}:
                     header[key] = _synapse_date(hdr_in.get(key))
                 else:
-                    header[key] = str(hdr_in.get(key)).strip()
+                    value = str(hdr_in.get(key)).strip()
+                    if key in {"bill_to_name"}:
+                        value = value[:40]
+                    header[key] = value
 
         # carrier is marked required in your sheet; enforce non-empty here.
         if not header["carrier"]:
