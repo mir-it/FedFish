@@ -272,12 +272,13 @@ class PalletDetailFrame(ttk.Frame):
 
         item_frame = ttk.LabelFrame(mid, text="Items", padding=5)
         item_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
-        icols = ("item", "qty", "uom", "po")
-        iheaders = ("Item #", "Qty", "UOM", "PO")
+        icols = ("item", "qty", "uom", "tracking", "po")
+        iheaders = ("Item #", "Qty", "UOM", "Tracking", "PO")
         self.item_tree = ttk.Treeview(item_frame, columns=icols, show="headings", height=10)
         for c, h in zip(icols, iheaders):
             self.item_tree.heading(c, text=h)
             self.item_tree.column(c, width=100, anchor="w")
+        self.item_tree.column("tracking", width=160, anchor="w")
         self.item_tree.pack(fill="both", expand=True)
 
         actions = ttk.Frame(self, padding=10)
@@ -349,7 +350,13 @@ class PalletDetailFrame(ttk.Frame):
                     continue
                 self.item_tree.insert(
                     "", "end",
-                    values=(r.get("item_num", ""), r.get("qty", ""), r.get("uom", ""), r.get("po_number", "")),
+                    values=(
+                        r.get("item_num", ""),
+                        r.get("qty", ""),
+                        r.get("uom", ""),
+                        r.get("tracking", ""),
+                        r.get("po_number", ""),
+                    ),
                 )
             self.app.set_status(f"Shipment {num}: {len(pallets)} pallets, {len(rows)} items.")
 
@@ -386,11 +393,12 @@ class PalletDetailFrame(ttk.Frame):
             return
 
         # Aggregate duplicate item lines (same item + uom).
-        aggregated: dict[tuple[str, str], float] = {}
+        aggregated: dict[tuple[str, str, str], float] = {}
         for r in self.app.current_items:
             item_num = str(r.get("item_num") or "").strip()
             if self._should_exclude_item(item_num):
                 continue
+            tracking = str(r.get("tracking") or "").strip()
             uom = normalize_uom(str(r.get("uom") or ""))
             qty = r.get("qty") or 0
             if not item_num or not uom:
@@ -399,12 +407,19 @@ class PalletDetailFrame(ttk.Frame):
                 qty_f = float(qty)
             except (TypeError, ValueError):
                 qty_f = 0.0
-            aggregated[(item_num, uom)] = aggregated.get((item_num, uom), 0.0) + qty_f
+            aggregated[(item_num, uom, tracking)] = aggregated.get((item_num, uom, tracking), 0.0) + qty_f
 
         review_lines: list[dict] = []
-        for (item_num, uom), qty in aggregated.items():
+        for (item_num, uom, tracking), qty in aggregated.items():
             if qty:
-                review_lines.append({"item": item_num, "fb_uom": uom, "fb_qty": qty})
+                review_lines.append(
+                    {
+                        "item": item_num,
+                        "tracking": tracking,
+                        "fb_uom": uom,
+                        "fb_qty": qty,
+                    }
+                )
 
         reviewed = self._review_synapse_lines(review_lines)
         if reviewed is None:
@@ -565,7 +580,7 @@ class PalletDetailFrame(ttk.Frame):
                     "coverage_sf_per_ea": cov,
                     "send_uom": send_uom,
                     "send_qty": send_qty,
-                    "lot_number": "",
+                    "lot_number": l.get("tracking", ""),
                     "note": note,
                 }
             )

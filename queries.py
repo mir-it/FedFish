@@ -31,6 +31,7 @@ SELECT
     stateconst.code AS state,
     ship.shipToZip AS zip,
     product.num AS item_num,
+    '' AS tracking,
     soitem.qtyOrdered AS qty,
     uom.code AS uom
 FROM ship
