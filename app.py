@@ -62,6 +62,21 @@ def _normalize_country(raw) -> str:
     return "USA" if c in {"US", "USA"} else c
 
 
+def _scac_from_carrier_name(raw_name: str) -> str:
+    name = str(raw_name or "").strip().lower()
+    scac_map = {
+        "will advise": "9999",
+        "freight": "FXSW",
+        "daylight": "DYLT",
+        "estes express lines": "EXLA",
+        "customer's own carrier": "CSPU",
+        "fedex": "FEDM",
+        "ups": "UPSM",
+        "usps": "UPSN",
+    }
+    return scac_map.get(name, "")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -229,7 +244,7 @@ class ShipmentsFrame(ttk.Frame):
 
         cols = ("ship_num", "city", "state", "zip", "pallets", "total_weight", "synapse_status")
         headers = ("Ship #", "City", "State", "Zip", "Pallets", "Total Weight (lb)", "Synapse")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
         for c, h in zip(cols, headers):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=130, anchor="w")
@@ -338,13 +353,14 @@ class PalletDetailFrame(ttk.Frame):
 
         item_frame = ttk.LabelFrame(mid, text="Items", padding=5)
         item_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
-        icols = ("item", "qty", "uom", "tracking", "po")
-        iheaders = ("Item #", "Qty", "UOM", "Tracking", "PO")
+        icols = ("item", "qty", "uom", "tracking", "carrier", "po")
+        iheaders = ("Item #", "Qty", "UOM", "Tracking", "Carrier", "PO")
         self.item_tree = ttk.Treeview(item_frame, columns=icols, show="headings", height=10)
         for c, h in zip(icols, iheaders):
             self.item_tree.heading(c, text=h)
             self.item_tree.column(c, width=100, anchor="w")
         self.item_tree.column("tracking", width=160, anchor="w")
+        self.item_tree.column("carrier", width=130, anchor="w")
         self.item_tree.pack(fill="both", expand=True)
 
         actions = ttk.Frame(self, padding=10)
@@ -426,6 +442,7 @@ class PalletDetailFrame(ttk.Frame):
                         r.get("qty", ""),
                         r.get("uom", ""),
                         r.get("tracking", ""),
+                        r.get("carrier_name", ""),
                         r.get("po_number", ""),
                     ),
                 )
@@ -538,10 +555,11 @@ class PalletDetailFrame(ttk.Frame):
                     }
                 )
 
-        reviewed = self._review_synapse_lines(review_lines)
-        if reviewed is None:
+        reviewed_payload = self._review_synapse_lines(review_lines)
+        if reviewed_payload is None:
             self.app.set_status("Synapse order cancelled.")
             return
+        reviewed, carrier = reviewed_payload
 
         details = [
             {
@@ -590,7 +608,6 @@ class PalletDetailFrame(ttk.Frame):
                 _row_get_any(so_row, "isThirdParty", "thirdPartyBilling", "thirdParty")
             )
             shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
-
         bill_to_name = str(
             _row_get_any(so_row, "billToName")
             or _row_get_any(customer_row, "name")
@@ -630,7 +647,8 @@ class PalletDetailFrame(ttk.Frame):
                 "reference": po_number,
                 "from_facility": config.SYNAPSE_FROM_FACILITY,
                 "to_facility": config.SYNAPSE_TO_FACILITY,
-                "carrier": config.SYNAPSE_CARRIER,
+                "carrier": carrier,
+                "ship_type": config.SYNAPSE_SHIP_TYPE,
                 "shipment_terms": shipment_terms or config.SYNAPSE_SHIPMENT_TERMS,
                 "ship_date": ship_date,
                 "appointment_date": requested_ship,
@@ -709,7 +727,7 @@ class PalletDetailFrame(ttk.Frame):
         keywords = [k.strip().lower() for k in (config.EXCLUDE_ITEM_KEYWORDS or "").split(",") if k.strip()]
         return any(k in s for k in keywords)
 
-    def _review_synapse_lines(self, lines: list[dict]) -> list[dict] | None:
+    def _review_synapse_lines(self, lines: list[dict]) -> tuple[list[dict], str] | None:
         coverage_map = {}
         if config.PRODUCT_COVERAGE_CSV:
             try:
@@ -766,9 +784,15 @@ class PalletDetailFrame(ttk.Frame):
                 }
             )
 
-        dlg = SynapseLinesDialog(self, rows)
+        carrier_name = str((self.app.current_items[0].get("carrier_name") if self.app.current_items else "") or "").strip()
+        initial_scac = _scac_from_carrier_name(carrier_name)
+        if not initial_scac:
+            initial_scac = config.SYNAPSE_CARRIER
+        dlg = SynapseLinesDialog(self, rows, initial_scac=initial_scac)
         self.wait_window(dlg)
-        return dlg.result
+        if dlg.result is None:
+            return None
+        return dlg.result, dlg.scac
 
     def _get_rates(self):
         num = self.app.current_ship_num
@@ -858,7 +882,7 @@ class PalletDetailFrame(ttk.Frame):
 
 
 class SynapseLinesDialog(tk.Toplevel):
-    def __init__(self, parent: ttk.Frame, rows: list[dict]):
+    def __init__(self, parent: ttk.Frame, rows: list[dict], initial_scac: str = ""):
         super().__init__(parent)
         self.title("Review Synapse Order Lines")
         self.geometry("900x420")
@@ -867,6 +891,7 @@ class SynapseLinesDialog(tk.Toplevel):
         self.grab_set()
 
         self.result: list[dict] | None = None
+        self.scac: str = ""
         self._rows = rows
 
         ttk.Label(
@@ -875,6 +900,11 @@ class SynapseLinesDialog(tk.Toplevel):
             "Double-click Send Qty to edit. Qty must be an integer.",
             justify="left",
         ).pack(fill="x", padx=10, pady=(10, 6))
+        scac_row = ttk.Frame(self)
+        scac_row.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(scac_row, text="SCAC:").pack(side="left")
+        self.scac_var = tk.StringVar(value=(initial_scac or "").strip())
+        ttk.Entry(scac_row, textvariable=self.scac_var, width=16).pack(side="left", padx=(6, 0))
 
         cols = ("item", "fb_qty", "fb_uom", "coverage", "send_qty", "send_uom", "lot", "note")
         headers = ("Item", "FB Qty", "FB UOM", "SF per EA", "Send Qty", "Send UOM", "Lot #", "Note")
@@ -986,6 +1016,10 @@ class SynapseLinesDialog(tk.Toplevel):
         )
 
     def _ok(self):
+        scac = (self.scac_var.get() or "").strip()
+        if not scac:
+            messagebox.showerror("Missing SCAC", "Enter a SCAC value.", parent=self)
+            return
         out: list[dict] = []
         for r in self._rows:
             qty = r.get("send_qty")
@@ -1011,6 +1045,7 @@ class SynapseLinesDialog(tk.Toplevel):
                     "lot_number": str(r.get("lot_number") or "").strip(),
                 }
             )
+        self.scac = scac
         self.result = out
         self.destroy()
 

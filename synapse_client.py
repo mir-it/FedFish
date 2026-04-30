@@ -119,6 +119,9 @@ class SynapseClient:
                 "Ship-to fields required: ship_to_name, ship_to_address_1, ship_to_city, "
                 "ship_to_state, ship_to_postal_code, ship_to_country_code"
             )
+        ship_type = str(hdr_in.get("ship_type") or "S").strip().upper()
+        if ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
+            ship_type = "S"
 
         # Minimal-but-valid header aligned to the provided schema keys.
         header: dict[str, Any] = {
@@ -131,7 +134,7 @@ class SynapseClient:
             "from_facility": from_facility,
             "to_facility": (hdr_in.get("to_facility") or from_facility).strip(),
             "priority": hdr_in.get("priority", "A"),
-            "ship_type": hdr_in.get("ship_type", "N"),
+            "ship_type": ship_type,
             "carrier": (hdr_in.get("carrier") or "").strip(),
             "reference": (hdr_in.get("reference") or po_number).strip(),
             "shipment_terms": hdr_in.get("shipment_terms", "3RD"),  # common default in your sheet

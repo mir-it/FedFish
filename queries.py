@@ -31,6 +31,21 @@ SELECT
     stateconst.code AS state,
     ship.shipToZip AS zip,
     product.num AS item_num,
+    (
+        SELECT sc.carrierId
+        FROM shipcarton sc
+        WHERE sc.shipId = ship.id
+        ORDER BY sc.id
+        LIMIT 1
+    ) AS carrier_id,
+    (
+        SELECT c.name
+        FROM shipcarton sc
+        LEFT JOIN carrier c ON c.id = sc.carrierId
+        WHERE sc.shipId = ship.id
+        ORDER BY sc.id
+        LIMIT 1
+    ) AS carrier_name,
     COALESCE(
         (
             SELECT ttv.info
