@@ -97,6 +97,7 @@ class App(tk.Tk):
         self.current_items: list[dict] = []
         self.current_order_context: dict = {}
         self.synapse_sent_shipments: set[str] = set()
+        self.synapse_failed_shipments: dict[str, str] = {}
 
         self.container = ttk.Frame(self)
         self.container.pack(fill="both", expand=True)
@@ -239,6 +240,7 @@ class ShipmentsFrame(ttk.Frame):
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
         ttk.Label(top, text="Packed Shipments", font=("TkDefaultFont", 14, "bold")).pack(side="left")
+        ttk.Button(top, text="Send All", command=self._send_all_synapse).pack(side="right")
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
@@ -250,6 +252,7 @@ class ShipmentsFrame(ttk.Frame):
             self.tree.column(c, width=130, anchor="w")
         self.tree.column("synapse_status", width=90, anchor="center")
         self.tree.tag_configure("synapse_sent", background="#dff0d8")
+        self.tree.tag_configure("synapse_failed", background="#f8d7da")
         self.tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.tree.bind("<Double-1>", lambda e: self._view_selected())
 
@@ -288,9 +291,13 @@ class ShipmentsFrame(ttk.Frame):
                         first.get("zip", ""),
                         len(pallets),
                         f"{total_w:.1f}",
-                        "SENT" if num in self.app.synapse_sent_shipments else "",
+                        "SENT" if num in self.app.synapse_sent_shipments else ("FAILED" if num in self.app.synapse_failed_shipments else ""),
                     ),
-                    tags=("synapse_sent",) if num in self.app.synapse_sent_shipments else (),
+                    tags=(
+                        ("synapse_sent",)
+                        if num in self.app.synapse_sent_shipments
+                        else (("synapse_failed",) if num in self.app.synapse_failed_shipments else ())
+                    ),
                 )
             self.app.set_status(f"Loaded {len(grouped)} shipments.")
 
@@ -298,6 +305,7 @@ class ShipmentsFrame(ttk.Frame):
 
     def mark_synapse_sent(self, ship_num: str):
         self.app.synapse_sent_shipments.add(ship_num)
+        self.app.synapse_failed_shipments.pop(ship_num, None)
         if not ship_num or not self.tree.exists(ship_num):
             return
         current_values = list(self.tree.item(ship_num, "values") or ())
@@ -305,6 +313,81 @@ class ShipmentsFrame(ttk.Frame):
             current_values += [""] * (7 - len(current_values))
         current_values[6] = "SENT"
         self.tree.item(ship_num, values=tuple(current_values), tags=("synapse_sent",))
+
+    def mark_synapse_failed(self, ship_num: str, reason: str):
+        self.app.synapse_failed_shipments[ship_num] = reason
+        self.app.synapse_sent_shipments.discard(ship_num)
+        if not ship_num or not self.tree.exists(ship_num):
+            return
+        current_values = list(self.tree.item(ship_num, "values") or ())
+        if len(current_values) < 7:
+            current_values += [""] * (7 - len(current_values))
+        current_values[6] = "FAILED"
+        self.tree.item(ship_num, values=tuple(current_values), tags=("synapse_failed",))
+
+    def _send_all_synapse(self):
+        if not config.SYNAPSE_USERNAME or not config.SYNAPSE_PASSWORD:
+            messagebox.showerror(
+                "Synapse not configured",
+                "Set SYNAPSE_USERNAME and SYNAPSE_PASSWORD in your .env (and restart the app).",
+            )
+            return
+        ship_nums = list(self.app.shipments_by_num.keys())
+        if not ship_nums:
+            messagebox.showinfo("No shipments", "No packed shipments available to send.")
+            return
+
+        detail_frame = self.app.frames.get("detail")
+        if not isinstance(detail_frame, PalletDetailFrame):
+            messagebox.showerror("Internal error", "Detail frame unavailable.")
+            return
+
+        self.app.set_status(f"Sending {len(ship_nums)} shipments to Synapse...")
+
+        def do():
+            client = SynapseClient(
+                SynapseConfig(
+                    base_url=config.SYNAPSE_BASE_URL,
+                    username=config.SYNAPSE_USERNAME,
+                    password=config.SYNAPSE_PASSWORD,
+                )
+            )
+            client.login()
+            results: list[dict] = []
+            for ship_num in ship_nums:
+                try:
+                    rows = self.app.fb.data_query(queries.items_sql_for(ship_num))
+                    ctx = detail_frame._load_order_context(ship_num)
+                    review_lines = detail_frame._build_review_lines(rows)
+                    reviewed = detail_frame._auto_review_synapse_lines(review_lines)
+                    carrier_name = next((str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()), "")
+                    scac = _scac_from_carrier_name(carrier_name) or config.SYNAPSE_CARRIER
+                    order_data = detail_frame._build_order_data(rows, ctx, reviewed, scac)
+                    client.create_order(order_data)
+                    results.append({"ship_num": ship_num, "ok": True})
+                except Exception as e:
+                    results.append({"ship_num": ship_num, "ok": False, "error": str(e)})
+            return results
+
+        def ok(results):
+            sent = 0
+            failed = 0
+            for r in results:
+                num = str(r.get("ship_num") or "")
+                if r.get("ok"):
+                    sent += 1
+                    self.mark_synapse_sent(num)
+                else:
+                    failed += 1
+                    self.mark_synapse_failed(num, str(r.get("error") or "Unknown error"))
+            self.app.set_status(f"Send all complete: {sent} sent, {failed} failed.")
+            messagebox.showinfo("Send All complete", f"Sent: {sent}\nFailed: {failed}")
+
+        def err(e):
+            messagebox.showerror("Send All error", str(e))
+            self.app.set_status("Send all failed.")
+
+        self.app.run_async(do, ok, err)
 
     def _view_selected(self):
         sel = self.tree.selection()
@@ -324,6 +407,7 @@ class ShipmentsFrame(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         self.app.shipments_by_num = {}
         self.app.synapse_sent_shipments = set()
+        self.app.synapse_failed_shipments = {}
         self.app.show("login")
 
 
@@ -480,6 +564,186 @@ class PalletDetailFrame(ttk.Frame):
             "so": so_row,
             "customer": customer_row,
         }
+
+    def _build_review_lines(self, rows: list[dict]) -> list[dict]:
+        aggregated: dict[tuple[str, str, str], float] = {}
+        for r in rows:
+            item_num = str(r.get("item_num") or "").strip()
+            if self._should_exclude_item(item_num):
+                continue
+            tracking = str(r.get("tracking") or "").strip()
+            uom = normalize_uom(str(r.get("uom") or ""))
+            qty = r.get("qty") or 0
+            if not item_num or not uom:
+                continue
+            try:
+                qty_f = float(qty)
+            except (TypeError, ValueError):
+                qty_f = 0.0
+            aggregated[(item_num, uom, tracking)] = aggregated.get((item_num, uom, tracking), 0.0) + qty_f
+        review_lines: list[dict] = []
+        for (item_num, uom, tracking), qty in aggregated.items():
+            if qty:
+                review_lines.append(
+                    {"item": item_num, "tracking": tracking, "fb_uom": uom, "fb_qty": qty}
+                )
+        return review_lines
+
+    def _auto_review_synapse_lines(self, lines: list[dict]) -> list[dict]:
+        coverage_map = {}
+        if config.PRODUCT_COVERAGE_CSV:
+            try:
+                coverage_map = load_coverage_map_from_csv(config.PRODUCT_COVERAGE_CSV)
+            except Exception:
+                coverage_map = {}
+
+        out: list[dict] = []
+        for l in lines:
+            item = l["item"]
+            item_key = item.upper()
+            fb_uom = normalize_uom(l.get("fb_uom", ""))
+            fb_qty = float(l.get("fb_qty") or 0)
+            cov = coverage_map.get(item_key).coverage_sf_per_ea if item_key in coverage_map else None
+
+            send_uom = "EA"
+            send_qty = None
+            if fb_uom == "SF" and cov:
+                send_qty, _ = suggest_each_qty(fb_qty, cov)
+            elif fb_uom in {"EA", "PCS"}:
+                send_uom = "EA"
+                send_qty = int(fb_qty) if float(fb_qty).is_integer() else None
+            elif fb_uom == "BOX":
+                send_uom = "BOX"
+                send_qty = int(fb_qty) if float(fb_qty).is_integer() else None
+
+            if send_qty is None:
+                raise ValueError(f"Missing Send Qty for item {item}.")
+            lot_number = str(l.get("tracking") or "").strip()
+            if config.SYNAPSE_REQUIRE_LOT and not lot_number:
+                raise ValueError(f"Lot number is required for item {item}.")
+            out.append(
+                {
+                    "item": item,
+                    "send_uom": send_uom,
+                    "send_qty": int(send_qty),
+                    "lot_number": lot_number,
+                }
+            )
+        return out
+
+    def _build_order_data(self, rows: list[dict], ctx: dict, reviewed: list[dict], carrier: str) -> dict:
+        if not rows:
+            raise ValueError("No items are loaded for this shipment yet.")
+        first = rows[0]
+        ship_row = ctx.get("ship", {}) or {}
+        so_row = ctx.get("so", {}) or {}
+        customer_row = ctx.get("customer", {}) or {}
+        po_number = str(first.get("po_number") or "").strip()
+        if not po_number:
+            raise ValueError("This shipment has no PO number in Fishbowl.")
+
+        ship_to_name = str(_row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or "").strip() or "SHIP TO"
+        ship_to_name = ship_to_name[:40]
+        ship_to_address_1 = str(_row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or "").strip()
+        ship_to_city = str(_row_get_any(ship_row, "shipToCity") or first.get("city") or "").strip()
+        ship_to_state = str(_row_get_any(ship_row, "shipToState", "shipToStateId") or first.get("state") or "").strip()
+        ship_to_postal_code = str(_row_get_any(ship_row, "shipToZip", "shipToPostalCode") or first.get("zip") or "").strip()
+        if not all([ship_to_address_1, ship_to_city, ship_to_state, ship_to_postal_code]):
+            raise ValueError("Fishbowl is missing one or more ship-to fields (address/city/state/zip) for this shipment.")
+
+        details = [
+            {
+                "item": r["item"],
+                "uom_entered": r["send_uom"],
+                "qty_entered": r["send_qty"],
+                "inventory_status": config.SYNAPSE_INVENTORY_STATUS,
+                "lot_number": r.get("lot_number", ""),
+            }
+            for r in reviewed
+        ]
+        if not details:
+            raise ValueError("Could not build any detail lines from Fishbowl items.")
+
+        ship_date = (
+            _parse_fb_date(_row_get_any(ship_row, "dateCreated", "dateLastModified"))
+            or _parse_fb_date(_row_get_any(so_row, "dateCreated", "dateIssued", "dateCompleted"))
+            or date.today()
+        )
+        requested_ship = _parse_fb_date(_row_get_any(so_row, "dateScheduledFulfillment", "dateFirstShip", "dateNeeded")) or ship_date
+        ship_no_later = _parse_fb_date(_row_get_any(so_row, "dateLastFulfillment", "dateDue", "dateExpiration")) or requested_ship
+        cancel_after = _parse_fb_date(_row_get_any(so_row, "dateExpiration", "dateExpires", "dateCompleted")) or (
+            ship_date + timedelta(days=max(config.SYNAPSE_CANCEL_AFTER_DAYS, 0))
+        )
+
+        shipment_terms = _normalize_terms(
+            str(_row_get_any(so_row, "shipmentTerms", "shipTerms", "freightTerms", "termCode") or "")
+        )
+        if not shipment_terms:
+            third_party_flag = _to_boolish(_row_get_any(so_row, "isThirdParty", "thirdPartyBilling", "thirdParty"))
+            shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
+
+        bill_to_name = str(_row_get_any(so_row, "billToName") or _row_get_any(customer_row, "name") or config.SYNAPSE_BILLTO_NAME or "").strip()[:40]
+        bill_to_address_1 = str(_row_get_any(so_row, "billToAddress", "billToAddress1") or config.SYNAPSE_BILLTO_ADDRESS_1 or "").strip()
+        bill_to_city = str(_row_get_any(so_row, "billToCity") or config.SYNAPSE_BILLTO_CITY or "").strip()
+        bill_to_state = str(_row_get_any(so_row, "billToState") or "").strip()
+        if not bill_to_state:
+            bill_to_state_id = _row_get_any(so_row, "billToStateId")
+            if bill_to_state_id not in (None, ""):
+                bill_to_state = self._state_code_from_id(bill_to_state_id)
+        if not bill_to_state:
+            bill_to_state = str(_row_get_any(customer_row, "state") or "").strip()
+        if not bill_to_state:
+            bill_to_state = str(config.SYNAPSE_BILLTO_STATE or "").strip()
+        bill_to_postal_code = str(_row_get_any(so_row, "billToZip", "billToPostalCode") or config.SYNAPSE_BILLTO_POSTAL_CODE or "").strip()
+        bill_to_country_code = _normalize_country(
+            _row_get_any(so_row, "billToCountry", "billToCountryCode") or config.SYNAPSE_BILLTO_COUNTRY_CODE or "USA"
+        )
+
+        order_data = {
+            "header": {
+                "func": "A",
+                "custid": config.SYNAPSE_CUSTID,
+                "po_number": po_number,
+                "order_type": "O",
+                "reference": po_number,
+                "from_facility": config.SYNAPSE_FROM_FACILITY,
+                "to_facility": config.SYNAPSE_TO_FACILITY,
+                "carrier": carrier,
+                "ship_type": config.SYNAPSE_SHIP_TYPE,
+                "shipment_terms": shipment_terms or config.SYNAPSE_SHIPMENT_TERMS,
+                "ship_date": ship_date,
+                "appointment_date": requested_ship,
+                "requested_ship": requested_ship,
+                "ship_not_before": requested_ship,
+                "ship_no_later": ship_no_later,
+                "cancel_after": cancel_after,
+                "shipper_name": config.SHIPPER_NAME,
+                "shipper_address_1": config.SHIPPER_ADDRESS_1,
+                "shipper_city": config.SHIPPER_CITY,
+                "shipper_state": config.SHIPPER_STATE,
+                "shipper_postal_code": config.SHIPPER_ZIP,
+                "shipper_country_code": _normalize_country(config.SHIPPER_COUNTRY),
+                "ship_to_name": ship_to_name,
+                "ship_to_address_1": ship_to_address_1,
+                "ship_to_city": ship_to_city,
+                "ship_to_state": ship_to_state,
+                "ship_to_postal_code": ship_to_postal_code,
+                "ship_to_country_code": "USA",
+            },
+            "details": details,
+        }
+        if (shipment_terms or config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper() == "3RD":
+            order_data["header"].update(
+                {
+                    "bill_to_name": bill_to_name,
+                    "bill_to_address_1": bill_to_address_1,
+                    "bill_to_city": bill_to_city,
+                    "bill_to_state": bill_to_state,
+                    "bill_to_postal_code": bill_to_postal_code,
+                    "bill_to_country_code": bill_to_country_code,
+                }
+            )
+        return order_data
 
     def _create_synapse_order(self):
         if not config.SYNAPSE_USERNAME or not config.SYNAPSE_PASSWORD:
@@ -715,6 +979,10 @@ class PalletDetailFrame(ttk.Frame):
             self.synapse_btn.config(state="normal")
             self._last_synapse_response = {"error": str(e)}
             self.toggle_raw_btn.config(state="normal")
+            if self.app.current_ship_num:
+                shipments_frame = self.app.frames.get("shipments")
+                if isinstance(shipments_frame, ShipmentsFrame):
+                    shipments_frame.mark_synapse_failed(self.app.current_ship_num, str(e))
             messagebox.showerror("Synapse error", str(e))
             self.app.set_status("Synapse order creation failed.")
 
