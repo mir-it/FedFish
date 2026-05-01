@@ -2,6 +2,7 @@ import json
 import queue
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk, messagebox
 from datetime import date, timedelta, datetime
 
@@ -170,12 +171,6 @@ HEADER_FIELD_LIMITS: dict[str, int] = {
     "ship_not_before": 8,
     "ship_no_later": 8,
     "cancel_after": 8,
-    "shipper_name": 40,
-    "shipper_address_1": 40,
-    "shipper_city": 30,
-    "shipper_state": 2,
-    "shipper_postal_code": 12,
-    "shipper_country_code": 3,
     "ship_to_name": 40,
     "ship_to_address_1": 40,
     "ship_to_city": 30,
@@ -198,8 +193,6 @@ HEADER_UPPERCASE_FIELDS: set[str] = {
     "carrier",
     "ship_type",
     "shipment_terms",
-    "shipper_state",
-    "shipper_country_code",
     "ship_to_state",
     "ship_to_country_code",
     "bill_to_state",
@@ -242,6 +235,9 @@ def _apply_header_field_limits(header: dict) -> dict:
     return normalized
 
 
+SENT_SHIPMENTS_FILE = Path(__file__).with_name("synapse_sent_shipments.txt")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -255,7 +251,7 @@ class App(tk.Tk):
         self.current_ship_num: str | None = None
         self.current_items: list[dict] = []
         self.current_order_context: dict = {}
-        self.synapse_sent_shipments: set[str] = set()
+        self.synapse_sent_shipments: set[str] = self._load_sent_shipments()
         self.synapse_failed_shipments: dict[str, str] = {}
 
         self.container = ttk.Frame(self)
@@ -323,6 +319,24 @@ class App(tk.Tk):
             except Exception:
                 pass
         self.destroy()
+
+    def _load_sent_shipments(self) -> set[str]:
+        if not SENT_SHIPMENTS_FILE.exists():
+            return set()
+        try:
+            lines = SENT_SHIPMENTS_FILE.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return set()
+        return {line.strip() for line in lines if line.strip()}
+
+    def save_sent_shipments(self):
+        payload = "\n".join(sorted(self.synapse_sent_shipments))
+        if payload:
+            payload += "\n"
+        try:
+            SENT_SHIPMENTS_FILE.write_text(payload, encoding="utf-8")
+        except Exception as e:
+            self.set_status(f"Warning: failed saving sent shipment memory ({e}).")
 
 
 class LoginFrame(ttk.Frame):
@@ -404,8 +418,9 @@ class ShipmentsFrame(ttk.Frame):
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
-        cols = ("ship_num", "city", "state", "zip", "pallets", "total_weight", "synapse_status")
-        headers = ("Ship #", "City", "State", "Zip", "Pallets", "Total Weight (lb)", "Synapse")
+        cols = ("ship_num", "city", "state", "zip", "total_weight", "synapse_status")
+        headers = ("Ship #", "City", "State", "Zip", "Total Weight (lb)", "Synapse")
+        self._status_col_idx = len(cols) - 1
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
         for c, h in zip(cols, headers):
             self.tree.heading(c, text=h)
@@ -449,7 +464,6 @@ class ShipmentsFrame(ttk.Frame):
                         first.get("city", ""),
                         first.get("state", ""),
                         first.get("zip", ""),
-                        len(pallets),
                         f"{total_w:.1f}",
                         "SENT" if num in self.app.synapse_sent_shipments else ("FAILED" if num in self.app.synapse_failed_shipments else ""),
                     ),
@@ -466,29 +480,34 @@ class ShipmentsFrame(ttk.Frame):
     def mark_synapse_sent(self, ship_num: str):
         self.app.synapse_sent_shipments.add(ship_num)
         self.app.synapse_failed_shipments.pop(ship_num, None)
+        self.app.save_sent_shipments()
         if not ship_num or not self.tree.exists(ship_num):
             return
         current_values = list(self.tree.item(ship_num, "values") or ())
-        if len(current_values) < 7:
-            current_values += [""] * (7 - len(current_values))
-        current_values[6] = "SENT"
+        if len(current_values) <= self._status_col_idx:
+            current_values += [""] * ((self._status_col_idx + 1) - len(current_values))
+        current_values[self._status_col_idx] = "SENT"
         self.tree.item(ship_num, values=tuple(current_values), tags=("synapse_sent",))
 
     def mark_synapse_failed(self, ship_num: str, reason: str):
         self.app.synapse_failed_shipments[ship_num] = reason
         self.app.synapse_sent_shipments.discard(ship_num)
+        self.app.save_sent_shipments()
         if not ship_num or not self.tree.exists(ship_num):
             return
         current_values = list(self.tree.item(ship_num, "values") or ())
-        if len(current_values) < 7:
-            current_values += [""] * (7 - len(current_values))
-        current_values[6] = "FAILED"
+        if len(current_values) <= self._status_col_idx:
+            current_values += [""] * ((self._status_col_idx + 1) - len(current_values))
+        current_values[self._status_col_idx] = "FAILED"
         self.tree.item(ship_num, values=tuple(current_values), tags=("synapse_failed",))
 
     def _send_all_synapse(self):
-        ship_nums = list(self.app.shipments_by_num.keys())
+        ship_nums = [
+            num for num in self.app.shipments_by_num.keys()
+            if num not in self.app.synapse_sent_shipments
+        ]
         if not ship_nums:
-            messagebox.showinfo("No shipments", "No packed shipments available to send.")
+            messagebox.showinfo("Nothing to send", "All packed shipments are already marked SENT.")
             return
         self._send_shipments_to_synapse(ship_nums, mode_label="all")
 
@@ -579,7 +598,6 @@ class ShipmentsFrame(ttk.Frame):
             self.app.fb = None
         self.tree.delete(*self.tree.get_children())
         self.app.shipments_by_num = {}
-        self.app.synapse_sent_shipments = set()
         self.app.synapse_failed_shipments = {}
         self.app.show("login")
 
@@ -928,12 +946,6 @@ class PalletDetailFrame(ttk.Frame):
                 "ship_not_before": requested_ship,
                 "ship_no_later": ship_no_later,
                 "cancel_after": cancel_after,
-                "shipper_name": config.SHIPPER_NAME,
-                "shipper_address_1": config.SHIPPER_ADDRESS_1,
-                "shipper_city": config.SHIPPER_CITY,
-                "shipper_state": config.SHIPPER_STATE,
-                "shipper_postal_code": config.SHIPPER_ZIP,
-                "shipper_country_code": _normalize_country(config.SHIPPER_COUNTRY),
                 "ship_to_name": ship_to_name,
                 "ship_to_address_1": ship_to_address_1,
                 "ship_to_city": ship_to_city,
@@ -1109,12 +1121,6 @@ class PalletDetailFrame(ttk.Frame):
                 "ship_not_before": requested_ship,
                 "ship_no_later": ship_no_later,
                 "cancel_after": cancel_after,
-                "shipper_name": config.SHIPPER_NAME,
-                "shipper_address_1": config.SHIPPER_ADDRESS_1,
-                "shipper_city": config.SHIPPER_CITY,
-                "shipper_state": config.SHIPPER_STATE,
-                "shipper_postal_code": config.SHIPPER_ZIP,
-                "shipper_country_code": _normalize_country(config.SHIPPER_COUNTRY),
                 "ship_to_name": ship_to_name,
                 "ship_to_address_1": ship_to_address_1,
                 "ship_to_city": ship_to_city,
