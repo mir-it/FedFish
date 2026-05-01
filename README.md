@@ -1,14 +1,14 @@
-# FedFish — Fishbowl → FedEx Freight Integration
+# FedFish — Fishbowl Shipping Automation
 
-Desktop app that pulls packed shipments from Fishbowl Server and requests LTL
-freight rate quotes from the FedEx Freight sandbox.
+Desktop app that pulls packed shipments from Fishbowl Server and sends them to
+Synapse as outbound orders.
 
 ## Setup
 
 ```
 pip install -r requirements.txt
 cp .env.example .env
-# fill in Fishbowl host/creds and FedEx API key / secret / account number
+# fill in Fishbowl host/creds and Synapse credentials
 python app.py
 ```
 
@@ -18,13 +18,12 @@ python app.py
 2. **Shipments** — table of packed shipments (statusId=20) for the configured
    location group.
 3. **Pallet detail** — select a shipment to see its pallets and line items.
-4. **Get FedEx Rates** — builds the FedEx payload from the pallet data and
-   POSTs to `/rate/v1/freight/rates/quotes`. Rates render in a table; toggle
-   "Show raw response" to see the full JSON.
+4. **Create Synapse Order** — builds the Synapse payload from the shipment and
+   sends it to Synapse. You can toggle "Show Synapse response" to inspect the
+   full request/response JSON.
 
 ## Notes
 
 - Location group filter and packed-status ID live at the top of `queries.py`.
-- Default freight class is `CLASS_050` (`fedex_client.py`).
-- FedEx token is cached in-memory for the session.
+- Synapse line conversions and lot requirements are controlled by `.env` values.
 - Package for Windows with `pyinstaller --onefile --windowed app.py`.

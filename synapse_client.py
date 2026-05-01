@@ -132,7 +132,6 @@ class SynapseClient:
             "ship_date": _synapse_date(hdr_in.get("ship_date")),
             "po_number": po_number,
             "from_facility": from_facility,
-            "to_facility": (hdr_in.get("to_facility") or from_facility).strip(),
             "priority": hdr_in.get("priority", "A"),
             "ship_type": ship_type,
             "carrier": (hdr_in.get("carrier") or "").strip(),
@@ -199,19 +198,13 @@ class SynapseClient:
             if not item_num or not uom or qty is None:
                 raise ValueError("Each detail requires: item, uom_entered, qty_entered")
 
-            inventory_status = (item.get("inventory_status") or "").strip()
             lot_number = (item.get("lot_number") or "").strip()
             line: dict[str, Any] = {
                 "item": item_num,
                 "uom_entered": uom,
                 "qty_entered": qty,
-                # Your prior code used this as the line number passthrough.
                 "dtl_pass_thru_num_10": int(item.get("dtl_pass_thru_num_10") or idx),
             }
-            # Synapse validation rejects empty strings; only send inventory status if present.
-            if inventory_status:
-                line["inventory_status_ind"] = "Y"
-                line["inventory_status"] = inventory_status
             # Synapse validation rejects empty string lots; only send if we have a value.
             if lot_number:
                 line["lot_number"] = lot_number

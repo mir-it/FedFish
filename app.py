@@ -8,7 +8,6 @@ from datetime import date, timedelta, datetime
 import config
 import queries
 from fishbowl_client import FishbowlClient, FishbowlError
-from fedex_client import FedexClient, FedexError
 from synapse_client import SynapseClient, SynapseConfig
 from uom_conversion import load_coverage_map_from_csv, normalize_uom, suggest_each_qty
 
@@ -70,27 +69,187 @@ def _scac_from_carrier_name(raw_name: str) -> str:
         "daylight": "DYLT",
         "estes express lines": "EXLA",
         "customer's own carrier": "CSPU",
-        "fedex": "FEDM",
         "ups": "UPSM",
         "usps": "UPSN",
     }
     return scac_map.get(name, "")
 
 
+SHIP_TYPE_BY_CARRIER_NAME_KEYWORDS: dict[str, tuple[str, ...]] = {
+    # Edit this mapping as needed to add more carrier-name patterns.
+    "S": ("ups ground",),
+    "A": ("air",),
+    "L": ("dhe", "ch robinson"),
+    "P": ("will call", "pick up", "customer's own carrier"),
+    "C": ("full container", "ocean"),
+}
+
+
+def _ship_type_from_carrier_name(raw_name: str) -> str:
+    name = str(raw_name or "").strip().lower()
+    if not name:
+        return ""
+    for ship_type, keywords in SHIP_TYPE_BY_CARRIER_NAME_KEYWORDS.items():
+        if any(k in name for k in keywords):
+            return ship_type
+    return ""
+
+
+SHIP_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("A", "Air"),
+    ("C", "Sea"),
+    ("L", "LTL"),
+    ("P", "Customer p/u"),
+    ("R", "Rail"),
+    ("S", "Small Package"),
+    ("T", "Truckload"),
+)
+
+
+def _ship_type_label_from_code(code: str) -> str:
+    normalized = str(code or "").strip().upper()
+    for option_code, desc in SHIP_TYPE_OPTIONS:
+        if normalized == option_code:
+            return f"{option_code} - {desc}"
+    default_code, default_desc = SHIP_TYPE_OPTIONS[0]
+    return f"{default_code} - {default_desc}"
+
+
+def _ship_type_code_from_label(label: str) -> str:
+    text = str(label or "").strip()
+    if not text:
+        return ""
+    code = text.split(" - ", 1)[0].strip().upper()
+    for option_code, _ in SHIP_TYPE_OPTIONS:
+        if code == option_code:
+            return option_code
+    return ""
+
+
+SHIPMENT_TERMS_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("3RD", "Third party collect"),
+    ("COL", "COLLECT"),
+    ("PCK", "CONSIGNEE P/U"),
+    ("PPD", "Prepaid"),
+)
+
+
+def _shipment_terms_label_from_code(code: str) -> str:
+    normalized = _normalize_terms(code)
+    for option_code, desc in SHIPMENT_TERMS_OPTIONS:
+        if normalized == option_code:
+            return f"{option_code} - {desc}"
+    default_code, default_desc = SHIPMENT_TERMS_OPTIONS[0]
+    return f"{default_code} - {default_desc}"
+
+
+def _shipment_terms_code_from_label(label: str) -> str:
+    text = str(label or "").strip()
+    if not text:
+        return ""
+    code = text.split(" - ", 1)[0].strip().upper()
+    for option_code, _ in SHIPMENT_TERMS_OPTIONS:
+        if code == option_code:
+            return option_code
+    return ""
+
+
+HEADER_FIELD_LIMITS: dict[str, int] = {
+    "func": 1,
+    "custid": 10,
+    "po_number": 20,
+    "order_type": 1,
+    "reference": 20,
+    "from_facility": 3,
+    "carrier": 10,
+    "ship_type": 1,
+    "shipment_terms": 3,
+    "ship_date": 8,
+    "appointment_date": 8,
+    "requested_ship": 8,
+    "ship_not_before": 8,
+    "ship_no_later": 8,
+    "cancel_after": 8,
+    "shipper_name": 40,
+    "shipper_address_1": 40,
+    "shipper_city": 30,
+    "shipper_state": 2,
+    "shipper_postal_code": 12,
+    "shipper_country_code": 3,
+    "ship_to_name": 40,
+    "ship_to_address_1": 40,
+    "ship_to_city": 30,
+    "ship_to_state": 2,
+    "ship_to_postal_code": 12,
+    "ship_to_country_code": 3,
+    "bill_to_name": 40,
+    "bill_to_address_1": 40,
+    "bill_to_city": 30,
+    "bill_to_state": 2,
+    "bill_to_postal_code": 12,
+    "bill_to_country_code": 3,
+}
+
+HEADER_UPPERCASE_FIELDS: set[str] = {
+    "func",
+    "custid",
+    "order_type",
+    "from_facility",
+    "carrier",
+    "ship_type",
+    "shipment_terms",
+    "shipper_state",
+    "shipper_country_code",
+    "ship_to_state",
+    "ship_to_country_code",
+    "bill_to_state",
+    "bill_to_country_code",
+}
+
+HEADER_DATE_FIELDS: set[str] = {
+    "ship_date",
+    "appointment_date",
+    "requested_ship",
+    "ship_not_before",
+    "ship_no_later",
+    "cancel_after",
+}
+
+
+def _format_header_date_yyyymmdd(value) -> str:
+    parsed = _parse_fb_date(value)
+    if parsed:
+        return parsed.strftime("%Y%m%d")
+    digits = "".join(ch for ch in str(value or "").strip() if ch.isdigit())
+    if len(digits) >= 8:
+        return digits[:8]
+    return str(value or "").strip()[:8]
+
+
+def _apply_header_field_limits(header: dict) -> dict:
+    normalized: dict[str, str] = {}
+    for key, value in header.items():
+        if key in HEADER_DATE_FIELDS:
+            normalized[key] = _format_header_date_yyyymmdd(value)
+            continue
+        text = str(value or "").strip()
+        if key in HEADER_UPPERCASE_FIELDS:
+            text = text.upper()
+        max_len = HEADER_FIELD_LIMITS.get(key)
+        if max_len is not None:
+            text = text[:max_len]
+        normalized[key] = text
+    return normalized
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Fishbowl → FedEx Freight")
+        self.title("Fishbowl Shipping")
         self.geometry("1000x650")
         self.minsize(900, 600)
 
         self.fb: FishbowlClient | None = None
-        self.fedex = FedexClient(
-            client_id=config.FEDEX_CLIENT_ID,
-            client_secret=config.FEDEX_CLIENT_SECRET,
-            account_number=config.FEDEX_ACCOUNT_NUMBER,
-            base_url=config.FEDEX_BASE_URL,
-        )
 
         self.shipments_by_num: dict[str, list[dict]] = {}
         self.current_ship_num: str | None = None
@@ -241,6 +400,7 @@ class ShipmentsFrame(ttk.Frame):
         top.pack(fill="x")
         ttk.Label(top, text="Packed Shipments", font=("TkDefaultFont", 14, "bold")).pack(side="left")
         ttk.Button(top, text="Send All", command=self._send_all_synapse).pack(side="right")
+        ttk.Button(top, text="Send Selected", command=self._send_selected_synapse).pack(side="right", padx=(0, 8))
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
@@ -326,15 +486,25 @@ class ShipmentsFrame(ttk.Frame):
         self.tree.item(ship_num, values=tuple(current_values), tags=("synapse_failed",))
 
     def _send_all_synapse(self):
+        ship_nums = list(self.app.shipments_by_num.keys())
+        if not ship_nums:
+            messagebox.showinfo("No shipments", "No packed shipments available to send.")
+            return
+        self._send_shipments_to_synapse(ship_nums, mode_label="all")
+
+    def _send_selected_synapse(self):
+        selected = list(self.tree.selection())
+        if not selected:
+            messagebox.showinfo("Select shipments", "Select one or more shipment rows first.")
+            return
+        self._send_shipments_to_synapse(selected, mode_label="selected")
+
+    def _send_shipments_to_synapse(self, ship_nums: list[str], mode_label: str):
         if not config.SYNAPSE_USERNAME or not config.SYNAPSE_PASSWORD:
             messagebox.showerror(
                 "Synapse not configured",
                 "Set SYNAPSE_USERNAME and SYNAPSE_PASSWORD in your .env (and restart the app).",
             )
-            return
-        ship_nums = list(self.app.shipments_by_num.keys())
-        if not ship_nums:
-            messagebox.showinfo("No shipments", "No packed shipments available to send.")
             return
 
         detail_frame = self.app.frames.get("detail")
@@ -342,7 +512,7 @@ class ShipmentsFrame(ttk.Frame):
             messagebox.showerror("Internal error", "Detail frame unavailable.")
             return
 
-        self.app.set_status(f"Sending {len(ship_nums)} shipments to Synapse...")
+        self.app.set_status(f"Sending {len(ship_nums)} {mode_label} shipment(s) to Synapse...")
 
         def do():
             client = SynapseClient(
@@ -362,7 +532,10 @@ class ShipmentsFrame(ttk.Frame):
                     reviewed = detail_frame._auto_review_synapse_lines(review_lines)
                     carrier_name = next((str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()), "")
                     scac = _scac_from_carrier_name(carrier_name) or config.SYNAPSE_CARRIER
-                    order_data = detail_frame._build_order_data(rows, ctx, reviewed, scac)
+                    ship_type = _ship_type_from_carrier_name(carrier_name) or config.SYNAPSE_SHIP_TYPE
+                    order_data = detail_frame._build_order_data(
+                        rows, ctx, reviewed, scac, ship_type_override=ship_type
+                    )
                     client.create_order(order_data)
                     results.append({"ship_num": ship_num, "ok": True})
                 except Exception as e:
@@ -380,12 +553,12 @@ class ShipmentsFrame(ttk.Frame):
                 else:
                     failed += 1
                     self.mark_synapse_failed(num, str(r.get("error") or "Unknown error"))
-            self.app.set_status(f"Send all complete: {sent} sent, {failed} failed.")
-            messagebox.showinfo("Send All complete", f"Sent: {sent}\nFailed: {failed}")
+            self.app.set_status(f"Send {mode_label} complete: {sent} sent, {failed} failed.")
+            messagebox.showinfo(f"Send {mode_label.title()} complete", f"Sent: {sent}\nFailed: {failed}")
 
         def err(e):
-            messagebox.showerror("Send All error", str(e))
-            self.app.set_status("Send all failed.")
+            messagebox.showerror(f"Send {mode_label.title()} error", str(e))
+            self.app.set_status(f"Send {mode_label} failed.")
 
         self.app.run_async(do, ok, err)
 
@@ -449,26 +622,21 @@ class PalletDetailFrame(ttk.Frame):
 
         actions = ttk.Frame(self, padding=10)
         actions.pack(fill="x")
-        self.quote_btn = ttk.Button(actions, text="Get FedEx Rates", command=self._get_rates)
-        self.quote_btn.pack(side="left")
         self.synapse_btn = ttk.Button(actions, text="Create Synapse Order", command=self._create_synapse_order)
-        self.synapse_btn.pack(side="left", padx=8)
-        self.toggle_raw_btn = ttk.Button(actions, text="Show raw response", command=self._toggle_raw, state="disabled")
+        self.synapse_btn.pack(side="left")
+        self.toggle_raw_btn = ttk.Button(
+            actions,
+            text="Show Synapse response",
+            command=self._toggle_raw,
+            state="disabled",
+        )
         self.toggle_raw_btn.pack(side="left", padx=8)
 
-        self.rates_frame = ttk.LabelFrame(self, text="FedEx Rates", padding=5)
-        self.rates_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        rcols = ("service", "transit", "charge", "currency")
-        rheaders = ("Service", "Transit", "Net Charge", "Currency")
-        self.rates_tree = ttk.Treeview(self.rates_frame, columns=rcols, show="headings", height=6)
-        for c, h in zip(rcols, rheaders):
-            self.rates_tree.heading(c, text=h)
-            self.rates_tree.column(c, width=150, anchor="w")
-        self.rates_tree.pack(fill="both", expand=True)
-
-        self.raw_text = tk.Text(self.rates_frame, height=10, wrap="none")
+        self.raw_frame = ttk.LabelFrame(self, text="Synapse Payload/Response", padding=5)
+        self.raw_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.raw_text = tk.Text(self.raw_frame, height=10, wrap="none")
+        self.raw_text.pack(fill="both", expand=True)
         self._raw_visible = False
-        self._last_response: dict | None = None
         self._last_synapse_response: dict | None = None
         self._last_synapse_payload: dict | None = None
 
@@ -496,10 +664,8 @@ class PalletDetailFrame(ttk.Frame):
             )
 
         self.item_tree.delete(*self.item_tree.get_children())
-        self.rates_tree.delete(*self.rates_tree.get_children())
         self.toggle_raw_btn.config(state="disabled")
         self._hide_raw()
-        self._last_response = None
         self._last_synapse_response = None
         self._last_synapse_payload = None
         self.app.current_order_context = {}
@@ -549,6 +715,19 @@ class PalletDetailFrame(ttk.Frame):
         row = self._query_first(queries.state_code_sql_for(state_int))
         return str(_row_get_any(row, "code") or "").strip()
 
+    def _ship_to_state_code(self, ship_row: dict, fallback_state: str = "") -> str:
+        state = str(_row_get_any(ship_row, "shipToState") or fallback_state or "").strip()
+        if not state:
+            state_id = _row_get_any(ship_row, "shipToStateId")
+            if state_id not in (None, ""):
+                state = self._state_code_from_id(state_id)
+        # Some Fishbowl schemas expose numeric state IDs in shipToState.
+        if state.isdigit():
+            mapped = self._state_code_from_id(state)
+            if mapped:
+                state = mapped
+        return state
+
     def _load_order_context(self, ship_num: str) -> dict:
         ship_row = self._query_first(queries.ship_sql_for(ship_num))
         so_row = self._query_first(queries.so_sql_for(ship_num))
@@ -567,6 +746,7 @@ class PalletDetailFrame(ttk.Frame):
 
     def _build_review_lines(self, rows: list[dict]) -> list[dict]:
         aggregated: dict[tuple[str, str, str], float] = {}
+        passthru_map: dict[tuple[str, str, str], str] = {}
         for r in rows:
             item_num = str(r.get("item_num") or "").strip()
             if self._should_exclude_item(item_num):
@@ -576,16 +756,32 @@ class PalletDetailFrame(ttk.Frame):
             qty = r.get("qty") or 0
             if not item_num or not uom:
                 continue
+            order_index = str(r.get("order_index") or "").strip()
+            key = (item_num, uom, tracking)
             try:
                 qty_f = float(qty)
             except (TypeError, ValueError):
                 qty_f = 0.0
-            aggregated[(item_num, uom, tracking)] = aggregated.get((item_num, uom, tracking), 0.0) + qty_f
+            aggregated[key] = aggregated.get(key, 0.0) + qty_f
+            if order_index and key not in passthru_map:
+                passthru_map[key] = order_index
         review_lines: list[dict] = []
         for (item_num, uom, tracking), qty in aggregated.items():
             if qty:
+                order_index = str(passthru_map.get((item_num, uom, tracking), "")).strip()
+                passthru_num = None
+                try:
+                    passthru_num = int(order_index) if order_index else None
+                except (TypeError, ValueError):
+                    passthru_num = None
                 review_lines.append(
-                    {"item": item_num, "tracking": tracking, "fb_uom": uom, "fb_qty": qty}
+                    {
+                        "item": item_num,
+                        "tracking": tracking,
+                        "fb_uom": uom,
+                        "fb_qty": qty,
+                        "dtl_pass_thru_num_10": passthru_num,
+                    }
                 )
         return review_lines
 
@@ -627,11 +823,20 @@ class PalletDetailFrame(ttk.Frame):
                     "send_uom": send_uom,
                     "send_qty": int(send_qty),
                     "lot_number": lot_number,
+                    "dtl_pass_thru_num_10": l.get("dtl_pass_thru_num_10"),
                 }
             )
         return out
 
-    def _build_order_data(self, rows: list[dict], ctx: dict, reviewed: list[dict], carrier: str) -> dict:
+    def _build_order_data(
+        self,
+        rows: list[dict],
+        ctx: dict,
+        reviewed: list[dict],
+        carrier: str,
+        ship_type_override: str = "",
+        shipment_terms_override: str = "",
+    ) -> dict:
         if not rows:
             raise ValueError("No items are loaded for this shipment yet.")
         first = rows[0]
@@ -646,7 +851,7 @@ class PalletDetailFrame(ttk.Frame):
         ship_to_name = ship_to_name[:40]
         ship_to_address_1 = str(_row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or "").strip()
         ship_to_city = str(_row_get_any(ship_row, "shipToCity") or first.get("city") or "").strip()
-        ship_to_state = str(_row_get_any(ship_row, "shipToState", "shipToStateId") or first.get("state") or "").strip()
+        ship_to_state = self._ship_to_state_code(ship_row, str(first.get("state") or ""))
         ship_to_postal_code = str(_row_get_any(ship_row, "shipToZip", "shipToPostalCode") or first.get("zip") or "").strip()
         if not all([ship_to_address_1, ship_to_city, ship_to_state, ship_to_postal_code]):
             raise ValueError("Fishbowl is missing one or more ship-to fields (address/city/state/zip) for this shipment.")
@@ -656,7 +861,7 @@ class PalletDetailFrame(ttk.Frame):
                 "item": r["item"],
                 "uom_entered": r["send_uom"],
                 "qty_entered": r["send_qty"],
-                "inventory_status": config.SYNAPSE_INVENTORY_STATUS,
+                "dtl_pass_thru_num_10": r.get("dtl_pass_thru_num_10"),
                 "lot_number": r.get("lot_number", ""),
             }
             for r in reviewed
@@ -681,6 +886,13 @@ class PalletDetailFrame(ttk.Frame):
         if not shipment_terms:
             third_party_flag = _to_boolish(_row_get_any(so_row, "isThirdParty", "thirdPartyBilling", "thirdParty"))
             shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
+        if shipment_terms_override:
+            shipment_terms = _normalize_terms(shipment_terms_override) or shipment_terms
+
+        carrier_name = next((str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()), "")
+        ship_type = str(ship_type_override or _ship_type_from_carrier_name(carrier_name) or config.SYNAPSE_SHIP_TYPE).strip().upper()
+        if ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
+            ship_type = config.SYNAPSE_SHIP_TYPE
 
         bill_to_name = str(_row_get_any(so_row, "billToName") or _row_get_any(customer_row, "name") or config.SYNAPSE_BILLTO_NAME or "").strip()[:40]
         bill_to_address_1 = str(_row_get_any(so_row, "billToAddress", "billToAddress1") or config.SYNAPSE_BILLTO_ADDRESS_1 or "").strip()
@@ -707,9 +919,8 @@ class PalletDetailFrame(ttk.Frame):
                 "order_type": "O",
                 "reference": po_number,
                 "from_facility": config.SYNAPSE_FROM_FACILITY,
-                "to_facility": config.SYNAPSE_TO_FACILITY,
                 "carrier": carrier,
-                "ship_type": config.SYNAPSE_SHIP_TYPE,
+                "ship_type": ship_type,
                 "shipment_terms": shipment_terms or config.SYNAPSE_SHIPMENT_TERMS,
                 "ship_date": ship_date,
                 "appointment_date": requested_ship,
@@ -743,6 +954,7 @@ class PalletDetailFrame(ttk.Frame):
                     "bill_to_country_code": bill_to_country_code,
                 }
             )
+        order_data["header"] = _apply_header_field_limits(order_data["header"])
         return order_data
 
     def _create_synapse_order(self):
@@ -779,7 +991,7 @@ class PalletDetailFrame(ttk.Frame):
             _row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or ""
         ).strip()
         ship_to_city = str(_row_get_any(ship_row, "shipToCity") or first.get("city") or "").strip()
-        ship_to_state = str(_row_get_any(ship_row, "shipToState", "shipToStateId") or first.get("state") or "").strip()
+        ship_to_state = self._ship_to_state_code(ship_row, str(first.get("state") or ""))
         ship_to_postal_code = str(
             _row_get_any(ship_row, "shipToZip", "shipToPostalCode") or first.get("zip") or ""
         ).strip()
@@ -790,47 +1002,38 @@ class PalletDetailFrame(ttk.Frame):
             )
             return
 
-        # Aggregate duplicate item lines (same item + uom).
-        aggregated: dict[tuple[str, str, str], float] = {}
-        for r in self.app.current_items:
-            item_num = str(r.get("item_num") or "").strip()
-            if self._should_exclude_item(item_num):
-                continue
-            tracking = str(r.get("tracking") or "").strip()
-            uom = normalize_uom(str(r.get("uom") or ""))
-            qty = r.get("qty") or 0
-            if not item_num or not uom:
-                continue
-            try:
-                qty_f = float(qty)
-            except (TypeError, ValueError):
-                qty_f = 0.0
-            aggregated[(item_num, uom, tracking)] = aggregated.get((item_num, uom, tracking), 0.0) + qty_f
+        review_lines = self._build_review_lines(self.app.current_items)
 
-        review_lines: list[dict] = []
-        for (item_num, uom, tracking), qty in aggregated.items():
-            if qty:
-                review_lines.append(
-                    {
-                        "item": item_num,
-                        "tracking": tracking,
-                        "fb_uom": uom,
-                        "fb_qty": qty,
-                    }
-                )
+        carrier_name = next(
+            (str(r.get("carrier_name") or "").strip() for r in self.app.current_items if str(r.get("carrier_name") or "").strip()),
+            "",
+        )
+        initial_scac = _scac_from_carrier_name(carrier_name) or config.SYNAPSE_CARRIER
+        initial_ship_type = _ship_type_from_carrier_name(carrier_name) or config.SYNAPSE_SHIP_TYPE
+        initial_shipment_terms = _normalize_terms(
+            str(_row_get_any(so_row, "shipmentTerms", "shipTerms", "freightTerms", "termCode") or "")
+        )
+        if not initial_shipment_terms:
+            third_party_flag = _to_boolish(_row_get_any(so_row, "isThirdParty", "thirdPartyBilling", "thirdParty"))
+            initial_shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
 
-        reviewed_payload = self._review_synapse_lines(review_lines)
+        reviewed_payload = self._review_synapse_lines(
+            review_lines,
+            initial_scac=initial_scac,
+            initial_ship_type=initial_ship_type,
+            initial_shipment_terms=initial_shipment_terms,
+        )
         if reviewed_payload is None:
             self.app.set_status("Synapse order cancelled.")
             return
-        reviewed, carrier = reviewed_payload
+        reviewed, carrier, ship_type, shipment_terms = reviewed_payload
 
         details = [
             {
                 "item": r["item"],
                 "uom_entered": r["send_uom"],
                 "qty_entered": r["send_qty"],
-                "inventory_status": config.SYNAPSE_INVENTORY_STATUS,
+                "dtl_pass_thru_num_10": r.get("dtl_pass_thru_num_10"),
                 "lot_number": r.get("lot_number", ""),
             }
             for r in reviewed
@@ -855,23 +1058,10 @@ class PalletDetailFrame(ttk.Frame):
             _row_get_any(so_row, "dateExpiration", "dateExpires", "dateCompleted")
         ) or (ship_date + timedelta(days=max(config.SYNAPSE_CANCEL_AFTER_DAYS, 0)))
 
-        shipment_terms = _normalize_terms(
-            str(
-                _row_get_any(
-                    so_row,
-                    "shipmentTerms",
-                    "shipTerms",
-                    "freightTerms",
-                    "termCode",
-                )
-                or ""
-            )
-        )
-        if not shipment_terms:
-            third_party_flag = _to_boolish(
-                _row_get_any(so_row, "isThirdParty", "thirdPartyBilling", "thirdParty")
-            )
-            shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
+        shipment_terms = _normalize_terms(shipment_terms) or (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
+        ship_type = str(ship_type or config.SYNAPSE_SHIP_TYPE).strip().upper()
+        if ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
+            ship_type = config.SYNAPSE_SHIP_TYPE
         bill_to_name = str(
             _row_get_any(so_row, "billToName")
             or _row_get_any(customer_row, "name")
@@ -910,9 +1100,8 @@ class PalletDetailFrame(ttk.Frame):
                 "order_type": "O",
                 "reference": po_number,
                 "from_facility": config.SYNAPSE_FROM_FACILITY,
-                "to_facility": config.SYNAPSE_TO_FACILITY,
                 "carrier": carrier,
-                "ship_type": config.SYNAPSE_SHIP_TYPE,
+                "ship_type": ship_type,
                 "shipment_terms": shipment_terms or config.SYNAPSE_SHIPMENT_TERMS,
                 "ship_date": ship_date,
                 "appointment_date": requested_ship,
@@ -948,6 +1137,7 @@ class PalletDetailFrame(ttk.Frame):
                     "bill_to_country_code": bill_to_country_code,
                 }
             )
+        order_data["header"] = _apply_header_field_limits(order_data["header"])
 
         self._last_synapse_payload = order_data
         self.synapse_btn.config(state="disabled")
@@ -995,7 +1185,13 @@ class PalletDetailFrame(ttk.Frame):
         keywords = [k.strip().lower() for k in (config.EXCLUDE_ITEM_KEYWORDS or "").split(",") if k.strip()]
         return any(k in s for k in keywords)
 
-    def _review_synapse_lines(self, lines: list[dict]) -> tuple[list[dict], str] | None:
+    def _review_synapse_lines(
+        self,
+        lines: list[dict],
+        initial_scac: str,
+        initial_ship_type: str,
+        initial_shipment_terms: str,
+    ) -> tuple[list[dict], str, str, str] | None:
         coverage_map = {}
         if config.PRODUCT_COVERAGE_CSV:
             try:
@@ -1048,74 +1244,22 @@ class PalletDetailFrame(ttk.Frame):
                     "send_uom": send_uom,
                     "send_qty": send_qty,
                     "lot_number": l.get("tracking", ""),
+                    "dtl_pass_thru_num_10": l.get("dtl_pass_thru_num_10"),
                     "note": note,
                 }
             )
 
-        carrier_name = str((self.app.current_items[0].get("carrier_name") if self.app.current_items else "") or "").strip()
-        initial_scac = _scac_from_carrier_name(carrier_name)
-        if not initial_scac:
-            initial_scac = config.SYNAPSE_CARRIER
-        dlg = SynapseLinesDialog(self, rows, initial_scac=initial_scac)
+        dlg = SynapseLinesDialog(
+            self,
+            rows,
+            initial_scac=initial_scac,
+            initial_ship_type=initial_ship_type,
+            initial_shipment_terms=initial_shipment_terms,
+        )
         self.wait_window(dlg)
         if dlg.result is None:
             return None
-        return dlg.result, dlg.scac
-
-    def _get_rates(self):
-        num = self.app.current_ship_num
-        pallets = self.app.shipments_by_num.get(num, [])
-        if not pallets:
-            messagebox.showwarning("No pallets", "This shipment has no pallets.")
-            return
-        first = pallets[0]
-
-        shipper = {
-            "city": config.SHIPPER_CITY,
-            "stateOrProvinceCode": config.SHIPPER_STATE,
-            "postalCode": config.SHIPPER_ZIP,
-            "countryCode": config.SHIPPER_COUNTRY,
-        }
-        recipient = {
-            "city": (first.get("city") or "").upper(),
-            "stateOrProvinceCode": first.get("state", ""),
-            "postalCode": str(first.get("zip", "")),
-            "countryCode": "US",
-        }
-
-        payload = self.app.fedex.build_payload(shipper, recipient, pallets)
-
-        self.quote_btn.config(state="disabled")
-        self.app.set_status("Requesting FedEx rates...")
-        self.rates_tree.delete(*self.rates_tree.get_children())
-
-        def do():
-            return self.app.fedex.rate_quote(payload)
-
-        def ok(resp):
-            self.quote_btn.config(state="normal")
-            self._last_response = resp
-            self.toggle_raw_btn.config(state="normal")
-            rates = FedexClient.extract_rates(resp)
-            if not rates:
-                self.app.set_status("FedEx returned no rate options. Check raw response.")
-            else:
-                for r in rates:
-                    self.rates_tree.insert(
-                        "", "end",
-                        values=(r["service"], r["transit"], r["net_charge"], r["currency"]),
-                    )
-                self.app.set_status(f"Received {len(rates)} rate options.")
-
-        def err(e):
-            self.quote_btn.config(state="normal")
-            if isinstance(e, FedexError):
-                self._last_response = {"error": str(e)}
-                self.toggle_raw_btn.config(state="normal")
-            messagebox.showerror("FedEx error", str(e))
-            self.app.set_status("FedEx request failed.")
-
-        self.app.run_async(do, ok, err)
+        return dlg.result, dlg.scac, dlg.ship_type, dlg.shipment_terms
 
     def _toggle_raw(self):
         if self._raw_visible:
@@ -1124,33 +1268,33 @@ class PalletDetailFrame(ttk.Frame):
             self._show_raw()
 
     def _show_raw(self):
-        if self._last_response is None and self._last_synapse_response is None:
+        if self._last_synapse_response is None and self._last_synapse_payload is None:
             return
-        self.rates_tree.pack_forget()
         self.raw_text.pack(fill="both", expand=True)
         self.raw_text.delete("1.0", "end")
-        if self._last_response is not None:
-            # FedEx mode
-            self.raw_text.insert("1.0", json.dumps(self._last_response, indent=2, default=str))
-        else:
-            # Synapse mode: show both request + response
-            bundle = {
-                "synapse_payload": self._last_synapse_payload,
-                "synapse_response": self._last_synapse_response,
-            }
-            self.raw_text.insert("1.0", json.dumps(bundle, indent=2, default=str))
-        self.toggle_raw_btn.config(text="Show rate table")
+        bundle = {
+            "synapse_payload": self._last_synapse_payload,
+            "synapse_response": self._last_synapse_response,
+        }
+        self.raw_text.insert("1.0", json.dumps(bundle, indent=2, default=str))
+        self.toggle_raw_btn.config(text="Hide Synapse response")
         self._raw_visible = True
 
     def _hide_raw(self):
         self.raw_text.pack_forget()
-        self.rates_tree.pack(fill="both", expand=True)
-        self.toggle_raw_btn.config(text="Show raw response")
+        self.toggle_raw_btn.config(text="Show Synapse response")
         self._raw_visible = False
 
 
 class SynapseLinesDialog(tk.Toplevel):
-    def __init__(self, parent: ttk.Frame, rows: list[dict], initial_scac: str = ""):
+    def __init__(
+        self,
+        parent: ttk.Frame,
+        rows: list[dict],
+        initial_scac: str = "",
+        initial_ship_type: str = "",
+        initial_shipment_terms: str = "",
+    ):
         super().__init__(parent)
         self.title("Review Synapse Order Lines")
         self.geometry("900x420")
@@ -1160,6 +1304,8 @@ class SynapseLinesDialog(tk.Toplevel):
 
         self.result: list[dict] | None = None
         self.scac: str = ""
+        self.ship_type: str = ""
+        self.shipment_terms: str = ""
         self._rows = rows
 
         ttk.Label(
@@ -1173,6 +1319,28 @@ class SynapseLinesDialog(tk.Toplevel):
         ttk.Label(scac_row, text="SCAC:").pack(side="left")
         self.scac_var = tk.StringVar(value=(initial_scac or "").strip())
         ttk.Entry(scac_row, textvariable=self.scac_var, width=16).pack(side="left", padx=(6, 0))
+        ttk.Label(scac_row, text="Ship Type:").pack(side="left", padx=(18, 6))
+        initial_ship_type = str(initial_ship_type or config.SYNAPSE_SHIP_TYPE).strip().upper()
+        if initial_ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
+            initial_ship_type = config.SYNAPSE_SHIP_TYPE
+        self.ship_type_var = tk.StringVar(value=_ship_type_label_from_code(initial_ship_type))
+        ttk.Combobox(
+            scac_row,
+            textvariable=self.ship_type_var,
+            width=24,
+            values=tuple(f"{code} - {desc}" for code, desc in SHIP_TYPE_OPTIONS),
+            state="readonly",
+        ).pack(side="left")
+        ttk.Label(scac_row, text="Shipment Terms:").pack(side="left", padx=(18, 6))
+        initial_terms_code = _normalize_terms(initial_shipment_terms) or (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
+        self.shipment_terms_var = tk.StringVar(value=_shipment_terms_label_from_code(initial_terms_code))
+        ttk.Combobox(
+            scac_row,
+            textvariable=self.shipment_terms_var,
+            width=28,
+            values=tuple(f"{code} - {desc}" for code, desc in SHIPMENT_TERMS_OPTIONS),
+            state="readonly",
+        ).pack(side="left")
 
         cols = ("item", "fb_qty", "fb_uom", "coverage", "send_qty", "send_uom", "lot", "note")
         headers = ("Item", "FB Qty", "FB UOM", "SF per EA", "Send Qty", "Send UOM", "Lot #", "Note")
@@ -1288,6 +1456,14 @@ class SynapseLinesDialog(tk.Toplevel):
         if not scac:
             messagebox.showerror("Missing SCAC", "Enter a SCAC value.", parent=self)
             return
+        ship_type = _ship_type_code_from_label(self.ship_type_var.get() or "")
+        if ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
+            messagebox.showerror("Invalid ship type", "Ship Type must be one of A, C, L, P, R, S, T.", parent=self)
+            return
+        shipment_terms = _shipment_terms_code_from_label(self.shipment_terms_var.get() or "")
+        if not shipment_terms:
+            messagebox.showerror("Missing shipment terms", "Select shipment terms.", parent=self)
+            return
         out: list[dict] = []
         for r in self._rows:
             qty = r.get("send_qty")
@@ -1311,9 +1487,12 @@ class SynapseLinesDialog(tk.Toplevel):
                     "send_uom": r["send_uom"],
                     "send_qty": qty,
                     "lot_number": str(r.get("lot_number") or "").strip(),
+                    "dtl_pass_thru_num_10": r.get("dtl_pass_thru_num_10"),
                 }
             )
         self.scac = scac
+        self.ship_type = ship_type
+        self.shipment_terms = shipment_terms
         self.result = out
         self.destroy()
 

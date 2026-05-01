@@ -60,6 +60,7 @@ SELECT
         ),
         ''
     ) AS tracking,
+    soitem.id AS order_index,
     soitem.qtyOrdered AS qty,
     uom.code AS uom
 FROM ship
