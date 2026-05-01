@@ -72,6 +72,8 @@ def _scac_from_carrier_name(raw_name: str) -> str:
         "customer's own carrier": "CSPU",
         "ups": "UPSM",
         "usps": "UPSN",
+        'fedex': "FEDM",
+        'aaa cooper': "AACT"
     }
     return scac_map.get(name, "")
 
