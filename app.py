@@ -78,6 +78,10 @@ def _scac_from_carrier_name(raw_name: str) -> str:
     return scac_map.get(name, "")
 
 
+def _normalize_carrier_name(raw_name: str) -> str:
+    return " ".join(str(raw_name or "").strip().lower().split())
+
+
 SHIP_TYPE_BY_CARRIER_NAME_KEYWORDS: dict[str, tuple[str, ...]] = {
     # Edit this mapping as needed to add more carrier-name patterns.
     "S": ("ups ground",),
@@ -238,6 +242,7 @@ def _apply_header_field_limits(header: dict) -> dict:
 
 
 SENT_SHIPMENTS_FILE = Path(__file__).with_name("synapse_sent_shipments.txt")
+CARRIER_SCAC_MAP_FILE = Path(__file__).with_name("carrier_scac_map.txt")
 
 
 class App(tk.Tk):
@@ -255,6 +260,7 @@ class App(tk.Tk):
         self.current_order_context: dict = {}
         self.synapse_sent_shipments: set[str] = self._load_sent_shipments()
         self.synapse_failed_shipments: dict[str, str] = {}
+        self.carrier_scac_map: dict[str, str] = self._load_carrier_scac_map()
 
         self.container = ttk.Frame(self)
         self.container.pack(fill="both", expand=True)
@@ -339,6 +345,51 @@ class App(tk.Tk):
             SENT_SHIPMENTS_FILE.write_text(payload, encoding="utf-8")
         except Exception as e:
             self.set_status(f"Warning: failed saving sent shipment memory ({e}).")
+
+    def _load_carrier_scac_map(self) -> dict[str, str]:
+        if not CARRIER_SCAC_MAP_FILE.exists():
+            return {}
+        try:
+            lines = CARRIER_SCAC_MAP_FILE.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return {}
+        out: dict[str, str] = {}
+        for line in lines:
+            text = line.strip()
+            if not text or "\t" not in text:
+                continue
+            carrier_key, scac = text.split("\t", 1)
+            carrier_norm = _normalize_carrier_name(carrier_key)
+            scac_norm = str(scac or "").strip().upper()
+            if carrier_norm and scac_norm:
+                out[carrier_norm] = scac_norm
+        return out
+
+    def save_carrier_scac_map(self):
+        lines = [f"{carrier}\t{scac}" for carrier, scac in sorted(self.carrier_scac_map.items()) if carrier and scac]
+        payload = "\n".join(lines)
+        if payload:
+            payload += "\n"
+        try:
+            CARRIER_SCAC_MAP_FILE.write_text(payload, encoding="utf-8")
+        except Exception as e:
+            self.set_status(f"Warning: failed saving carrier SCAC map ({e}).")
+
+    def resolve_scac_for_carrier(self, carrier_name: str) -> str:
+        carrier_norm = _normalize_carrier_name(carrier_name)
+        if carrier_norm and carrier_norm in self.carrier_scac_map:
+            return self.carrier_scac_map[carrier_norm]
+        return _scac_from_carrier_name(carrier_name) or config.SYNAPSE_CARRIER
+
+    def remember_scac_for_carrier(self, carrier_name: str, scac: str):
+        carrier_norm = _normalize_carrier_name(carrier_name)
+        scac_norm = str(scac or "").strip().upper()
+        if not carrier_norm or not scac_norm:
+            return
+        if self.carrier_scac_map.get(carrier_norm) == scac_norm:
+            return
+        self.carrier_scac_map[carrier_norm] = scac_norm
+        self.save_carrier_scac_map()
 
 
 class LoginFrame(ttk.Frame):
@@ -552,7 +603,7 @@ class ShipmentsFrame(ttk.Frame):
                     review_lines = detail_frame._build_review_lines(rows)
                     reviewed = detail_frame._auto_review_synapse_lines(review_lines)
                     carrier_name = next((str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()), "")
-                    scac = _scac_from_carrier_name(carrier_name) or config.SYNAPSE_CARRIER
+                    scac = self.app.resolve_scac_for_carrier(carrier_name)
                     ship_type = _ship_type_from_carrier_name(carrier_name) or config.SYNAPSE_SHIP_TYPE
                     order_data = detail_frame._build_order_data(
                         rows, ctx, reviewed, scac, ship_type_override=ship_type
@@ -1022,7 +1073,7 @@ class PalletDetailFrame(ttk.Frame):
             (str(r.get("carrier_name") or "").strip() for r in self.app.current_items if str(r.get("carrier_name") or "").strip()),
             "",
         )
-        initial_scac = _scac_from_carrier_name(carrier_name) or config.SYNAPSE_CARRIER
+        initial_scac = self.app.resolve_scac_for_carrier(carrier_name)
         initial_ship_type = _ship_type_from_carrier_name(carrier_name) or config.SYNAPSE_SHIP_TYPE
         initial_shipment_terms = _normalize_terms(
             str(_row_get_any(so_row, "shipmentTerms", "shipTerms", "freightTerms", "termCode") or "")
@@ -1166,6 +1217,7 @@ class PalletDetailFrame(ttk.Frame):
             self.synapse_btn.config(state="normal")
             self._last_synapse_response = resp
             self.toggle_raw_btn.config(state="normal")
+            self.app.remember_scac_for_carrier(carrier_name, carrier)
             if self.app.current_ship_num:
                 shipments_frame = self.app.frames.get("shipments")
                 if isinstance(shipments_frame, ShipmentsFrame):
