@@ -211,6 +211,18 @@ class SynapseClient:
             details.append(line)
 
         payload = {"header": header, "details": details}
+        hdrinstruct_in = order_data.get("hdrinstruct") or {}
+        hdrinstruct_custid = str(hdrinstruct_in.get("custid") or "").strip()
+        hdrinstruct_reference = str(hdrinstruct_in.get("reference") or header.get("reference") or "").strip()
+        hdrinstruct_po_number = str(hdrinstruct_in.get("po_number") or header.get("po_number") or "").strip()
+        instructions = str(hdrinstruct_in.get("instructions") or "").strip()
+        if instructions:
+            payload["hdrinstruct"] = {
+                "custid": hdrinstruct_custid or "MIRMOS",
+                "reference": hdrinstruct_reference,
+                "po_number": hdrinstruct_po_number,
+                "instructions": instructions[:255],
+            }
 
         resp = self.session.post(
             f"{self.cfg.base_url}/api/orders/create-order",

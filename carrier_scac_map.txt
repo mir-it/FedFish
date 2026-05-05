@@ -1,1 +1,3 @@
+daylight	DYLT
 fedex freight	FXSW
+freight	FXSW

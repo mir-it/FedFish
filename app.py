@@ -90,6 +90,7 @@ SHIP_TYPE_BY_CARRIER_NAME_KEYWORDS: dict[str, tuple[str, ...]] = {
     "P": ("will call", "pick up", "customer's own carrier"),
     "C": ("full container", "ocean"),
 }
+VALID_SHIP_TYPES: set[str] = {"A", "C", "L", "P", "R", "S", "T"}
 
 
 def _ship_type_from_carrier_name(raw_name: str) -> str:
@@ -243,6 +244,7 @@ def _apply_header_field_limits(header: dict) -> dict:
 
 SENT_SHIPMENTS_FILE = Path(__file__).with_name("synapse_sent_shipments.txt")
 CARRIER_SCAC_MAP_FILE = Path(__file__).with_name("carrier_scac_map.txt")
+CARRIER_SHIP_TYPE_MAP_FILE = Path(__file__).with_name("carrier_ship_type_map.txt")
 
 
 class App(tk.Tk):
@@ -258,9 +260,11 @@ class App(tk.Tk):
         self.current_ship_num: str | None = None
         self.current_items: list[dict] = []
         self.current_order_context: dict = {}
+        self.hdr_instructions_by_ship: dict[str, str] = {}
         self.synapse_sent_shipments: set[str] = self._load_sent_shipments()
         self.synapse_failed_shipments: dict[str, str] = {}
         self.carrier_scac_map: dict[str, str] = self._load_carrier_scac_map()
+        self.carrier_ship_type_map: dict[str, str] = self._load_carrier_ship_type_map()
 
         self.container = ttk.Frame(self)
         self.container.pack(fill="both", expand=True)
@@ -390,6 +394,56 @@ class App(tk.Tk):
             return
         self.carrier_scac_map[carrier_norm] = scac_norm
         self.save_carrier_scac_map()
+
+    def _load_carrier_ship_type_map(self) -> dict[str, str]:
+        if not CARRIER_SHIP_TYPE_MAP_FILE.exists():
+            return {}
+        try:
+            lines = CARRIER_SHIP_TYPE_MAP_FILE.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return {}
+        out: dict[str, str] = {}
+        for line in lines:
+            text = line.strip()
+            if not text or "\t" not in text:
+                continue
+            carrier_key, ship_type = text.split("\t", 1)
+            carrier_norm = _normalize_carrier_name(carrier_key)
+            ship_type_norm = str(ship_type or "").strip().upper()
+            if carrier_norm and ship_type_norm in VALID_SHIP_TYPES:
+                out[carrier_norm] = ship_type_norm
+        return out
+
+    def save_carrier_ship_type_map(self):
+        lines = [
+            f"{carrier}\t{ship_type}"
+            for carrier, ship_type in sorted(self.carrier_ship_type_map.items())
+            if carrier and ship_type in VALID_SHIP_TYPES
+        ]
+        payload = "\n".join(lines)
+        if payload:
+            payload += "\n"
+        try:
+            CARRIER_SHIP_TYPE_MAP_FILE.write_text(payload, encoding="utf-8")
+        except Exception as e:
+            self.set_status(f"Warning: failed saving carrier ship type map ({e}).")
+
+    def resolve_ship_type_for_carrier(self, carrier_name: str) -> str:
+        carrier_norm = _normalize_carrier_name(carrier_name)
+        if carrier_norm and carrier_norm in self.carrier_ship_type_map:
+            return self.carrier_ship_type_map[carrier_norm]
+        resolved = str(_ship_type_from_carrier_name(carrier_name) or config.SYNAPSE_SHIP_TYPE).strip().upper()
+        return resolved if resolved in VALID_SHIP_TYPES else config.SYNAPSE_SHIP_TYPE
+
+    def remember_ship_type_for_carrier(self, carrier_name: str, ship_type: str):
+        carrier_norm = _normalize_carrier_name(carrier_name)
+        ship_type_norm = str(ship_type or "").strip().upper()
+        if not carrier_norm or ship_type_norm not in VALID_SHIP_TYPES:
+            return
+        if self.carrier_ship_type_map.get(carrier_norm) == ship_type_norm:
+            return
+        self.carrier_ship_type_map[carrier_norm] = ship_type_norm
+        self.save_carrier_ship_type_map()
 
 
 class LoginFrame(ttk.Frame):
@@ -604,12 +658,17 @@ class ShipmentsFrame(ttk.Frame):
                     reviewed = detail_frame._auto_review_synapse_lines(review_lines)
                     carrier_name = next((str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()), "")
                     scac = self.app.resolve_scac_for_carrier(carrier_name)
-                    ship_type = _ship_type_from_carrier_name(carrier_name) or config.SYNAPSE_SHIP_TYPE
+                    ship_type = self.app.resolve_ship_type_for_carrier(carrier_name)
                     order_data = detail_frame._build_order_data(
-                        rows, ctx, reviewed, scac, ship_type_override=ship_type
+                        rows,
+                        ctx,
+                        reviewed,
+                        scac,
+                        ship_type_override=ship_type,
+                        hdr_instructions=self.app.hdr_instructions_by_ship.get(ship_num, ""),
                     )
                     client.create_order(order_data)
-                    results.append({"ship_num": ship_num, "ok": True})
+                    results.append({"ship_num": ship_num, "ok": True, "carrier_name": carrier_name, "scac": scac, "ship_type": ship_type})
                 except Exception as e:
                     results.append({"ship_num": ship_num, "ok": False, "error": str(e)})
             return results
@@ -622,6 +681,8 @@ class ShipmentsFrame(ttk.Frame):
                 if r.get("ok"):
                     sent += 1
                     self.mark_synapse_sent(num)
+                    self.app.remember_scac_for_carrier(str(r.get("carrier_name") or ""), str(r.get("scac") or ""))
+                    self.app.remember_ship_type_for_carrier(str(r.get("carrier_name") or ""), str(r.get("ship_type") or ""))
                 else:
                     failed += 1
                     self.mark_synapse_failed(num, str(r.get("error") or "Unknown error"))
@@ -703,6 +764,16 @@ class PalletDetailFrame(ttk.Frame):
         )
         self.toggle_raw_btn.pack(side="left", padx=8)
 
+        instruct_frame = ttk.LabelFrame(self, text="Order Instructions (hdrinstruct.instructions)", padding=5)
+        instruct_frame.pack(fill="x", padx=10, pady=(0, 10))
+        self.instructions_var = tk.StringVar(value="")
+        self.instructions_entry = ttk.Entry(instruct_frame, textvariable=self.instructions_var)
+        self.instructions_entry.pack(side="left", fill="x", expand=True)
+        self.instructions_count_var = tk.StringVar(value="0/255")
+        ttk.Label(instruct_frame, textvariable=self.instructions_count_var).pack(side="right", padx=(8, 0))
+        self._instructions_trace_suspended = False
+        self.instructions_var.trace_add("write", self._on_instructions_change)
+
         self.raw_frame = ttk.LabelFrame(self, text="Synapse Payload/Response", padding=5)
         self.raw_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.raw_text = tk.Text(self.raw_frame, height=10, wrap="none")
@@ -720,6 +791,7 @@ class PalletDetailFrame(ttk.Frame):
         self.title_var.set(
             f"Ship #{num}  →  {first.get('city', '')}, {first.get('state', '')}  {first.get('zip', '')}"
         )
+        self._set_instructions_text(self.app.hdr_instructions_by_ship.get(num, ""))
 
         self.pallet_tree.delete(*self.pallet_tree.get_children())
         for i, p in enumerate(pallets, start=1):
@@ -907,6 +979,7 @@ class PalletDetailFrame(ttk.Frame):
         carrier: str,
         ship_type_override: str = "",
         shipment_terms_override: str = "",
+        hdr_instructions: str = "",
     ) -> dict:
         if not rows:
             raise ValueError("No items are loaded for this shipment yet.")
@@ -961,8 +1034,8 @@ class PalletDetailFrame(ttk.Frame):
             shipment_terms = _normalize_terms(shipment_terms_override) or shipment_terms
 
         carrier_name = next((str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()), "")
-        ship_type = str(ship_type_override or _ship_type_from_carrier_name(carrier_name) or config.SYNAPSE_SHIP_TYPE).strip().upper()
-        if ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
+        ship_type = str(ship_type_override or self.app.resolve_ship_type_for_carrier(carrier_name) or config.SYNAPSE_SHIP_TYPE).strip().upper()
+        if ship_type not in VALID_SHIP_TYPES:
             ship_type = config.SYNAPSE_SHIP_TYPE
 
         bill_to_name = str(_row_get_any(so_row, "billToName") or _row_get_any(customer_row, "name") or config.SYNAPSE_BILLTO_NAME or "").strip()[:40]
@@ -1020,6 +1093,16 @@ class PalletDetailFrame(ttk.Frame):
                 }
             )
         order_data["header"] = _apply_header_field_limits(order_data["header"])
+        instructions_text = str(hdr_instructions or "").strip()
+        if instructions_text:
+            header_reference = str(order_data.get("header", {}).get("reference") or "").strip()
+            header_po_number = str(order_data.get("header", {}).get("po_number") or "").strip()
+            order_data["hdrinstruct"] = {
+                "custid": "MIRMOS",
+                "reference": header_reference,
+                "po_number": header_po_number,
+                "instructions": instructions_text[:255],
+            }
         return order_data
 
     def _create_synapse_order(self):
@@ -1074,7 +1157,7 @@ class PalletDetailFrame(ttk.Frame):
             "",
         )
         initial_scac = self.app.resolve_scac_for_carrier(carrier_name)
-        initial_ship_type = _ship_type_from_carrier_name(carrier_name) or config.SYNAPSE_SHIP_TYPE
+        initial_ship_type = self.app.resolve_ship_type_for_carrier(carrier_name)
         initial_shipment_terms = _normalize_terms(
             str(_row_get_any(so_row, "shipmentTerms", "shipTerms", "freightTerms", "termCode") or "")
         )
@@ -1125,7 +1208,7 @@ class PalletDetailFrame(ttk.Frame):
 
         shipment_terms = _normalize_terms(shipment_terms) or (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
         ship_type = str(ship_type or config.SYNAPSE_SHIP_TYPE).strip().upper()
-        if ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
+        if ship_type not in VALID_SHIP_TYPES:
             ship_type = config.SYNAPSE_SHIP_TYPE
         bill_to_name = str(
             _row_get_any(so_row, "billToName")
@@ -1197,6 +1280,16 @@ class PalletDetailFrame(ttk.Frame):
                 }
             )
         order_data["header"] = _apply_header_field_limits(order_data["header"])
+        instructions_text = str(self.instructions_var.get() or "").strip()
+        if instructions_text:
+            header_reference = str(order_data.get("header", {}).get("reference") or "").strip()
+            header_po_number = str(order_data.get("header", {}).get("po_number") or "").strip()
+            order_data["hdrinstruct"] = {
+                "custid": "MIRMOS",
+                "reference": header_reference,
+                "po_number": header_po_number,
+                "instructions": instructions_text[:255],
+            }
 
         self._last_synapse_payload = order_data
         self.synapse_btn.config(state="disabled")
@@ -1218,6 +1311,7 @@ class PalletDetailFrame(ttk.Frame):
             self._last_synapse_response = resp
             self.toggle_raw_btn.config(state="normal")
             self.app.remember_scac_for_carrier(carrier_name, carrier)
+            self.app.remember_ship_type_for_carrier(carrier_name, ship_type)
             if self.app.current_ship_num:
                 shipments_frame = self.app.frames.get("shipments")
                 if isinstance(shipments_frame, ShipmentsFrame):
@@ -1237,6 +1331,33 @@ class PalletDetailFrame(ttk.Frame):
             self.app.set_status("Synapse order creation failed.")
 
         self.app.run_async(do, ok, err)
+
+    def _set_instructions_text(self, value: str):
+        self._instructions_trace_suspended = True
+        try:
+            capped = str(value or "")[:255]
+            self.instructions_var.set(capped)
+            self.instructions_count_var.set(f"{len(capped)}/255")
+        finally:
+            self._instructions_trace_suspended = False
+
+    def _on_instructions_change(self, *_):
+        if self._instructions_trace_suspended:
+            return
+        current = str(self.instructions_var.get() or "")
+        if len(current) > 255:
+            current = current[:255]
+            self._set_instructions_text(current)
+        else:
+            self.instructions_count_var.set(f"{len(current)}/255")
+
+        ship_num = self.app.current_ship_num
+        if not ship_num:
+            return
+        if current.strip():
+            self.app.hdr_instructions_by_ship[ship_num] = current
+        else:
+            self.app.hdr_instructions_by_ship.pop(ship_num, None)
 
     def _should_exclude_item(self, item_num: str) -> bool:
         s = (item_num or "").strip().lower()
