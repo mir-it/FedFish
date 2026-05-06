@@ -5,6 +5,7 @@ from datetime import date, datetime
 from typing import Any
 
 import requests
+import re
 
 
 def _to_int_qty(value: Any) -> int:
@@ -32,25 +33,31 @@ def _to_int_qty(value: Any) -> int:
     raise ValueError(f"qty_entered must be an integer (got {type(value).__name__})")
 
 
-def _synapse_date(value: Any) -> str:
-    """
-    Synapse expects dates as MM/DD/YYYY (per API validation pattern).
-    Accepts date/datetime/ISO-string (YYYY-MM-DD) or already-formatted strings.
-    Falls back to today's date.
-    """
+_SYNAPSE_MDY_DATE_RE = re.compile(r"^(0?[1-9]|1[0-2])[/-](0?[1-9]|[12][0-9]|3[01])[/-](19|20)\d\d")
+
+
+def _normalize_ship_date(value: Any) -> str:
+    """Normalize incoming ship_date to Synapse-friendly MM/DD/YYYY."""
     if isinstance(value, datetime):
         return value.strftime("%m/%d/%Y")
     if isinstance(value, date):
         return value.strftime("%m/%d/%Y")
-    if isinstance(value, str) and value.strip():
-        s = value.strip()
-        # Convert ISO date -> Synapse date
+    s = str(value or "").strip()
+    if not s:
+        raise ValueError("header.ship_date is required")
+    if _SYNAPSE_MDY_DATE_RE.match(s):
+        return s
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
         try:
-            d = date.fromisoformat(s)
-            return d.strftime("%m/%d/%Y")
+            return datetime.strptime(s, fmt).strftime("%m/%d/%Y")
         except ValueError:
-            return s
-    return date.today().strftime("%m/%d/%Y")
+            continue
+    # Handle ISO values like 2026-04-23T07:00:00.000+00:00 or trailing Z.
+    iso_candidate = s.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(iso_candidate).strftime("%m/%d/%Y")
+    except ValueError as e:
+        raise ValueError(f"header.ship_date has unsupported format: {s}") from e
 
 
 @dataclass(frozen=True)
@@ -122,14 +129,14 @@ class SynapseClient:
         ship_type = str(hdr_in.get("ship_type") or "S").strip().upper()
         if ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
             ship_type = "S"
+        ship_date = _normalize_ship_date(hdr_in.get("ship_date"))
 
         # Minimal-but-valid header aligned to the provided schema keys.
         header: dict[str, Any] = {
             "func": hdr_in.get("func", "A"),  # A=add (per your sheet: A/U/R/D)
             "custid": custid,
             "order_type": "O",
-            "appointment_date": _synapse_date(hdr_in.get("appointment_date")),
-            "ship_date": _synapse_date(hdr_in.get("ship_date")),
+            "ship_date": ship_date,
             "po_number": po_number,
             "from_facility": from_facility,
             "priority": hdr_in.get("priority", "A"),
@@ -170,21 +177,12 @@ class SynapseClient:
             "bill_to_country_code",
             "bill_to_phone",
             "bill_to_email",
-            # dates/windows commonly used for allocation
-            "cancel_after",
-            "requested_ship",
-            "ship_not_before",
-            "ship_no_later",
         ]:
             if key in hdr_in and str(hdr_in.get(key) or "").strip():
-                # date-like fields must be MM/DD/YYYY
-                if key in {"cancel_after", "requested_ship", "ship_not_before", "ship_no_later"}:
-                    header[key] = _synapse_date(hdr_in.get(key))
-                else:
-                    value = str(hdr_in.get(key)).strip()
-                    if key in {"bill_to_name"}:
-                        value = value[:40]
-                    header[key] = value
+                value = str(hdr_in.get(key)).strip()
+                if key in {"bill_to_name"}:
+                    value = value[:40]
+                header[key] = value
 
         # carrier is marked required in your sheet; enforce non-empty here.
         if not header["carrier"]:

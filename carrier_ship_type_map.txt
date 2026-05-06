@@ -1,1 +1,5 @@
+daylight	S
+fedex	S
 fedex freight	L
+freight	S
+saia	S

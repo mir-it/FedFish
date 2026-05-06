@@ -61,6 +61,7 @@ SELECT
         ''
     ) AS tracking,
     soitem.id AS order_index,
+    soitem.dateScheduledFulfillment AS date_scheduled_fulfillment,
     soitem.qtyOrdered AS qty,
     uom.code AS uom
 FROM ship

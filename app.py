@@ -1,10 +1,11 @@
 import json
 import queue
+import re
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, messagebox
-from datetime import date, timedelta, datetime
+from datetime import date, datetime
 
 import config
 import queries
@@ -39,7 +40,13 @@ def _parse_fb_date(value) -> date | None:
     text = str(value).strip()
     if not text:
         return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%m/%d/%Y %H:%M:%S"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%m/%d/%Y",
+        "%m/%d/%Y %H:%M:%S",
+    ):
         try:
             return datetime.strptime(text, fmt).date()
         except ValueError:
@@ -60,6 +67,16 @@ def _normalize_country(raw) -> str:
     if not c:
         return ""
     return "USA" if c in {"US", "USA"} else c
+
+
+_LOT_PREFIX_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}/")
+
+
+def _normalize_lot_number(raw_lot) -> str:
+    lot = str(raw_lot or "").strip()
+    if not lot:
+        return ""
+    return _LOT_PREFIX_RE.sub("", lot, count=1).strip()
 
 
 def _scac_from_carrier_name(raw_name: str) -> str:
@@ -172,12 +189,6 @@ HEADER_FIELD_LIMITS: dict[str, int] = {
     "carrier": 10,
     "ship_type": 1,
     "shipment_terms": 3,
-    "ship_date": 8,
-    "appointment_date": 8,
-    "requested_ship": 8,
-    "ship_not_before": 8,
-    "ship_no_later": 8,
-    "cancel_after": 8,
     "ship_to_name": 40,
     "ship_to_address_1": 40,
     "ship_to_city": 30,
@@ -206,14 +217,7 @@ HEADER_UPPERCASE_FIELDS: set[str] = {
     "bill_to_country_code",
 }
 
-HEADER_DATE_FIELDS: set[str] = {
-    "ship_date",
-    "appointment_date",
-    "requested_ship",
-    "ship_not_before",
-    "ship_no_later",
-    "cancel_after",
-}
+HEADER_DATE_FIELDS: set[str] = set()
 
 
 def _format_header_date_yyyymmdd(value) -> str:
@@ -665,7 +669,7 @@ class ShipmentsFrame(ttk.Frame):
                         reviewed,
                         scac,
                         ship_type_override=ship_type,
-                        hdr_instructions=self.app.hdr_instructions_by_ship.get(ship_num, ""),
+                        hdr_instructions=detail_frame._resolved_hdr_instructions(ship_num, ctx),
                     )
                     client.create_order(order_data)
                     results.append({"ship_num": ship_num, "ok": True, "carrier_name": carrier_name, "scac": scac, "ship_type": ship_type})
@@ -824,6 +828,7 @@ class PalletDetailFrame(ttk.Frame):
             rows, ctx = payload
             self.app.current_items = rows
             self.app.current_order_context = ctx
+            self._set_instructions_text(self._resolved_hdr_instructions(num, ctx))
             for r in rows:
                 item_num = str(r.get("item_num", "") or "")
                 if self._should_exclude_item(item_num):
@@ -886,6 +891,29 @@ class PalletDetailFrame(ttk.Frame):
             "so": so_row,
             "customer": customer_row,
         }
+
+    def _ship_note_instructions(self, ctx: dict) -> str:
+        ship_row = ctx.get("ship", {}) or {}
+        return str(_row_get_any(ship_row, "note", "notes") or "").strip()
+
+    def _resolved_hdr_instructions(self, ship_num: str, ctx: dict) -> str:
+        manual = str(self.app.hdr_instructions_by_ship.get(ship_num, "") or "")
+        if manual.strip():
+            return manual
+        return self._ship_note_instructions(ctx)
+
+    def _ship_date_from_soitem_rows(self, rows: list[dict]) -> str:
+        for r in rows:
+            raw = _row_get_any(
+                r,
+                "date_scheduled_fulfillment",
+                "dateScheduledFulfillment",
+                "datescheduledfulfillment",
+            )
+            text = str(raw or "").strip()
+            if text:
+                return text
+        return ""
 
     def _build_review_lines(self, rows: list[dict]) -> list[dict]:
         aggregated: dict[tuple[str, str, str], float] = {}
@@ -957,7 +985,7 @@ class PalletDetailFrame(ttk.Frame):
 
             if send_qty is None:
                 raise ValueError(f"Missing Send Qty for item {item}.")
-            lot_number = str(l.get("tracking") or "").strip()
+            lot_number = _normalize_lot_number(l.get("tracking"))
             if config.SYNAPSE_REQUIRE_LOT and not lot_number:
                 raise ValueError(f"Lot number is required for item {item}.")
             out.append(
@@ -1006,24 +1034,16 @@ class PalletDetailFrame(ttk.Frame):
                 "uom_entered": r["send_uom"],
                 "qty_entered": r["send_qty"],
                 "dtl_pass_thru_num_10": r.get("dtl_pass_thru_num_10"),
-                "lot_number": r.get("lot_number", ""),
+                "lot_number": _normalize_lot_number(r.get("lot_number", "")),
             }
             for r in reviewed
         ]
         if not details:
             raise ValueError("Could not build any detail lines from Fishbowl items.")
 
-        ship_date = (
-            _parse_fb_date(_row_get_any(ship_row, "dateCreated", "dateLastModified"))
-            or _parse_fb_date(_row_get_any(so_row, "dateCreated", "dateIssued", "dateCompleted"))
-            or date.today()
-        )
-        requested_ship = _parse_fb_date(_row_get_any(so_row, "dateScheduledFulfillment", "dateFirstShip", "dateNeeded")) or ship_date
-        ship_no_later = _parse_fb_date(_row_get_any(so_row, "dateLastFulfillment", "dateDue", "dateExpiration")) or requested_ship
-        cancel_after = _parse_fb_date(_row_get_any(so_row, "dateExpiration", "dateExpires", "dateCompleted")) or (
-            ship_date + timedelta(days=max(config.SYNAPSE_CANCEL_AFTER_DAYS, 0))
-        )
-
+        ship_date = self._ship_date_from_soitem_rows(rows)
+        if not ship_date:
+            raise ValueError("Missing soitem.dateScheduledFulfillment for this shipment.")
         shipment_terms = _normalize_terms(
             str(_row_get_any(so_row, "shipmentTerms", "shipTerms", "freightTerms", "termCode") or "")
         )
@@ -1067,11 +1087,6 @@ class PalletDetailFrame(ttk.Frame):
                 "ship_type": ship_type,
                 "shipment_terms": shipment_terms or config.SYNAPSE_SHIPMENT_TERMS,
                 "ship_date": ship_date,
-                "appointment_date": requested_ship,
-                "requested_ship": requested_ship,
-                "ship_not_before": requested_ship,
-                "ship_no_later": ship_no_later,
-                "cancel_after": cancel_after,
                 "ship_to_name": ship_to_name,
                 "ship_to_address_1": ship_to_address_1,
                 "ship_to_city": ship_to_city,
@@ -1182,7 +1197,7 @@ class PalletDetailFrame(ttk.Frame):
                 "uom_entered": r["send_uom"],
                 "qty_entered": r["send_qty"],
                 "dtl_pass_thru_num_10": r.get("dtl_pass_thru_num_10"),
-                "lot_number": r.get("lot_number", ""),
+                "lot_number": _normalize_lot_number(r.get("lot_number", "")),
             }
             for r in reviewed
         ]
@@ -1190,22 +1205,13 @@ class PalletDetailFrame(ttk.Frame):
             messagebox.showerror("No order lines", "Could not build any detail lines from Fishbowl items.")
             return
 
-        # Date windows used by many warehouses for allocation.
-        ship_date = (
-            _parse_fb_date(_row_get_any(ship_row, "dateCreated", "dateLastModified"))
-            or _parse_fb_date(_row_get_any(so_row, "dateCreated", "dateIssued", "dateCompleted"))
-            or date.today()
-        )
-        requested_ship = _parse_fb_date(
-            _row_get_any(so_row, "dateScheduledFulfillment", "dateFirstShip", "dateNeeded")
-        ) or ship_date
-        ship_no_later = _parse_fb_date(
-            _row_get_any(so_row, "dateLastFulfillment", "dateDue", "dateExpiration")
-        ) or requested_ship
-        cancel_after = _parse_fb_date(
-            _row_get_any(so_row, "dateExpiration", "dateExpires", "dateCompleted")
-        ) or (ship_date + timedelta(days=max(config.SYNAPSE_CANCEL_AFTER_DAYS, 0)))
-
+        ship_date = self._ship_date_from_soitem_rows(self.app.current_items)
+        if not ship_date:
+            messagebox.showerror(
+                "Missing Ship Date",
+                "No valid soitem.dateScheduledFulfillment was found for this shipment.",
+            )
+            return
         shipment_terms = _normalize_terms(shipment_terms) or (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
         ship_type = str(ship_type or config.SYNAPSE_SHIP_TYPE).strip().upper()
         if ship_type not in VALID_SHIP_TYPES:
@@ -1252,11 +1258,6 @@ class PalletDetailFrame(ttk.Frame):
                 "ship_type": ship_type,
                 "shipment_terms": shipment_terms or config.SYNAPSE_SHIPMENT_TERMS,
                 "ship_date": ship_date,
-                "appointment_date": requested_ship,
-                "requested_ship": requested_ship,
-                "ship_not_before": requested_ship,
-                "ship_no_later": ship_no_later,
-                "cancel_after": cancel_after,
                 "ship_to_name": ship_to_name,
                 "ship_to_address_1": ship_to_address_1,
                 "ship_to_city": ship_to_city,
@@ -1424,7 +1425,7 @@ class PalletDetailFrame(ttk.Frame):
                     "coverage_sf_per_ea": cov,
                     "send_uom": send_uom,
                     "send_qty": send_qty,
-                    "lot_number": l.get("tracking", ""),
+                    "lot_number": _normalize_lot_number(l.get("tracking", "")),
                     "dtl_pass_thru_num_10": l.get("dtl_pass_thru_num_10"),
                     "note": note,
                 }
@@ -1655,7 +1656,8 @@ class SynapseLinesDialog(tk.Toplevel):
                     parent=self,
                 )
                 return
-            if config.SYNAPSE_REQUIRE_LOT and not str(r.get("lot_number") or "").strip():
+            normalized_lot = _normalize_lot_number(r.get("lot_number") or "")
+            if config.SYNAPSE_REQUIRE_LOT and not normalized_lot:
                 messagebox.showerror(
                     "Missing lot number",
                     f"Lot number is required for item {r['item']}. Double-click the Lot # cell to enter it.",
@@ -1667,7 +1669,7 @@ class SynapseLinesDialog(tk.Toplevel):
                     "item": r["item"],
                     "send_uom": r["send_uom"],
                     "send_qty": qty,
-                    "lot_number": str(r.get("lot_number") or "").strip(),
+                    "lot_number": normalized_lot,
                     "dtl_pass_thru_num_10": r.get("dtl_pass_thru_num_10"),
                 }
             )
