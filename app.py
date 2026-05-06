@@ -10,7 +10,7 @@ from datetime import date, datetime
 import config
 import queries
 from fishbowl_client import FishbowlClient, FishbowlError
-from synapse_client import SynapseClient, SynapseConfig
+from synapse_client import SynapseClient, SynapseConfig, SynapseCreateOrderError
 from uom_conversion import load_coverage_map_from_csv, normalize_uom, suggest_each_qty
 
 
@@ -839,7 +839,7 @@ class PalletDetailFrame(ttk.Frame):
                         r.get("item_num", ""),
                         r.get("qty", ""),
                         r.get("uom", ""),
-                        r.get("tracking", ""),
+                        _normalize_lot_number(r.get("tracking", "")),
                         r.get("carrier_name", ""),
                         r.get("po_number", ""),
                     ),
@@ -922,7 +922,7 @@ class PalletDetailFrame(ttk.Frame):
             item_num = str(r.get("item_num") or "").strip()
             if self._should_exclude_item(item_num):
                 continue
-            tracking = str(r.get("tracking") or "").strip()
+            tracking = _normalize_lot_number(r.get("tracking"))
             uom = normalize_uom(str(r.get("uom") or ""))
             qty = r.get("qty") or 0
             if not item_num or not uom:
@@ -1292,7 +1292,7 @@ class PalletDetailFrame(ttk.Frame):
                 "instructions": instructions_text[:255],
             }
 
-        self._last_synapse_payload = order_data
+        self._last_synapse_payload = None
         self.synapse_btn.config(state="disabled")
         self.app.set_status("Creating Synapse order...")
 
@@ -1305,11 +1305,16 @@ class PalletDetailFrame(ttk.Frame):
                 )
             )
             client.login()
-            return client.create_order(order_data)
+            response = client.create_order(order_data)
+            return {
+                "response": response,
+                "sent_payload": client.last_payload_sent,
+            }
 
-        def ok(resp):
+        def ok(result):
             self.synapse_btn.config(state="normal")
-            self._last_synapse_response = resp
+            self._last_synapse_response = result.get("response")
+            self._last_synapse_payload = result.get("sent_payload")
             self.toggle_raw_btn.config(state="normal")
             self.app.remember_scac_for_carrier(carrier_name, carrier)
             self.app.remember_ship_type_for_carrier(carrier_name, ship_type)
@@ -1323,6 +1328,8 @@ class PalletDetailFrame(ttk.Frame):
         def err(e):
             self.synapse_btn.config(state="normal")
             self._last_synapse_response = {"error": str(e)}
+            if isinstance(e, SynapseCreateOrderError):
+                self._last_synapse_payload = e.sent_payload
             self.toggle_raw_btn.config(state="normal")
             if self.app.current_ship_num:
                 shipments_frame = self.app.frames.get("shipments")

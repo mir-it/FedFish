@@ -67,10 +67,17 @@ class SynapseConfig:
     password: str
 
 
+class SynapseCreateOrderError(ValueError):
+    def __init__(self, message: str, sent_payload: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.sent_payload = sent_payload
+
+
 class SynapseClient:
     def __init__(self, cfg: SynapseConfig, session: requests.Session | None = None):
         self.cfg = cfg
         self.session = session or requests.Session()
+        self.last_payload_sent: dict[str, Any] | None = None
 
     def login(self) -> None:
         resp = self.session.post(
@@ -222,6 +229,7 @@ class SynapseClient:
                 "instructions": instructions[:255],
             }
 
+        self.last_payload_sent = payload
         resp = self.session.post(
             f"{self.cfg.base_url}/api/orders/create-order",
             json=payload,
@@ -233,7 +241,10 @@ class SynapseClient:
                 body: Any = resp.json()
             except ValueError:
                 body = resp.text
-            raise ValueError(f"Synapse create-order failed ({resp.status_code}): {body}")
+            raise SynapseCreateOrderError(
+                f"Synapse create-order failed ({resp.status_code}): {body}",
+                sent_payload=payload,
+            )
         try:
             return resp.json()
         except ValueError:
