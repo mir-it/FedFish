@@ -69,14 +69,31 @@ def _normalize_country(raw) -> str:
     return "USA" if c in {"US", "USA"} else c
 
 
-_LOT_PREFIX_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}/")
+def _synapse_reference_from_ship_num(raw_ship_num) -> str:
+    ship_num = str(raw_ship_num or "").strip()
+    if not ship_num:
+        return ""
+    if ship_num[:1].upper() == "S":
+        return ship_num[1:].strip()
+    return ship_num
+
+
+_LOT_WITH_QTY_UOM_DATE_PREFIX_RE = re.compile(
+    r"^(?:\d+\s*[a-zA-Z]+\s+)?\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}\s*/\s*(.+)$",
+    re.IGNORECASE,
+)
+_LOT_DATE_PREFIX_RE = re.compile(r"^\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}\s*/\s*")
 
 
 def _normalize_lot_number(raw_lot) -> str:
     lot = str(raw_lot or "").strip()
     if not lot:
         return ""
-    return _LOT_PREFIX_RE.sub("", lot, count=1).strip()
+    lot = " ".join(lot.split())
+    prefixed = _LOT_WITH_QTY_UOM_DATE_PREFIX_RE.match(lot)
+    if prefixed:
+        return prefixed.group(1).strip()
+    return _LOT_DATE_PREFIX_RE.sub("", lot, count=1).strip()
 
 
 def _scac_from_carrier_name(raw_name: str) -> str:
@@ -1018,6 +1035,9 @@ class PalletDetailFrame(ttk.Frame):
         po_number = str(first.get("po_number") or "").strip()
         if not po_number:
             raise ValueError("This shipment has no PO number in Fishbowl.")
+        ship_num_value = _synapse_reference_from_ship_num(
+            _row_get_any(ship_row, "num") or self.app.current_ship_num
+        )
 
         ship_to_name = str(_row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or "").strip() or "SHIP TO"
         ship_to_name = ship_to_name[:40]
@@ -1081,7 +1101,7 @@ class PalletDetailFrame(ttk.Frame):
                 "custid": config.SYNAPSE_CUSTID,
                 "po_number": po_number,
                 "order_type": "O",
-                "reference": po_number,
+                "reference": ship_num_value,
                 "from_facility": config.SYNAPSE_FROM_FACILITY,
                 "carrier": carrier,
                 "ship_type": ship_type,
@@ -1145,6 +1165,9 @@ class PalletDetailFrame(ttk.Frame):
         if not po_number:
             messagebox.showerror("Missing PO", "This shipment has no PO number in Fishbowl.")
             return
+        ship_num_value = _synapse_reference_from_ship_num(
+            _row_get_any(ship_row, "num") or ship_num
+        )
 
         ship_to_name = str(
             _row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or ""
@@ -1252,7 +1275,7 @@ class PalletDetailFrame(ttk.Frame):
                 "custid": config.SYNAPSE_CUSTID,
                 "po_number": po_number,
                 "order_type": "O",
-                "reference": po_number,
+                "reference": ship_num_value,
                 "from_facility": config.SYNAPSE_FROM_FACILITY,
                 "carrier": carrier,
                 "ship_type": ship_type,
