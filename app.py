@@ -537,22 +537,35 @@ class ShipmentsFrame(ttk.Frame):
     def __init__(self, parent, app: App):
         super().__init__(parent)
         self.app = app
+        self._all_shipment_rows: list[dict] = []
 
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
         ttk.Label(top, text="Packed Shipments", font=("TkDefaultFont", 14, "bold")).pack(side="left")
+        ttk.Label(top, text="Salesperson:").pack(side="left", padx=(16, 6))
+        self.salesperson_filter_var = tk.StringVar(value="All Salespeople")
+        self.salesperson_filter = ttk.Combobox(
+            top,
+            textvariable=self.salesperson_filter_var,
+            values=("All Salespeople",),
+            state="readonly",
+            width=26,
+        )
+        self.salesperson_filter.pack(side="left")
+        self.salesperson_filter.bind("<<ComboboxSelected>>", lambda _e: self._render_shipments())
         ttk.Button(top, text="Send All", command=self._send_all_synapse).pack(side="right")
         ttk.Button(top, text="Send Selected", command=self._send_selected_synapse).pack(side="right", padx=(0, 8))
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
-        cols = ("ship_num", "city", "state", "zip", "total_weight", "synapse_status")
-        headers = ("Ship #", "City", "State", "Zip", "Total Weight (lb)", "Synapse")
+        cols = ("ship_num", "salesperson", "city", "state", "zip", "total_weight", "synapse_status")
+        headers = ("Ship #", "Salesperson", "City", "State", "Zip", "Total Weight (lb)", "Synapse")
         self._status_col_idx = len(cols) - 1
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
         for c, h in zip(cols, headers):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=130, anchor="w")
+        self.tree.column("salesperson", width=180, anchor="w")
         self.tree.column("synapse_status", width=90, anchor="center")
         self.tree.tag_configure("synapse_sent", background="#dff0d8")
         self.tree.tag_configure("synapse_failed", background="#f8d7da")
@@ -580,30 +593,102 @@ class ShipmentsFrame(ttk.Frame):
             for r in rows:
                 grouped.setdefault(r["ship_num"], []).append(r)
             self.app.shipments_by_num = grouped
+            collected_rows: list[dict] = []
             for num, pallets in grouped.items():
                 first = pallets[0]
                 total_w = sum(float(p.get("weight") or 0) for p in pallets)
-                self.tree.insert(
-                    "",
-                    "end",
-                    iid=num,
-                    values=(
-                        num,
-                        first.get("city", ""),
-                        first.get("state", ""),
-                        first.get("zip", ""),
-                        f"{total_w:.1f}",
-                        "SENT" if num in self.app.synapse_sent_shipments else ("FAILED" if num in self.app.synapse_failed_shipments else ""),
-                    ),
-                    tags=(
-                        ("synapse_sent",)
-                        if num in self.app.synapse_sent_shipments
-                        else (("synapse_failed",) if num in self.app.synapse_failed_shipments else ())
-                    ),
+                collected_rows.append(
+                    {
+                        "ship_num": str(num),
+                        "salesperson": self._salesperson_for_ship(str(num)),
+                        "city": str(first.get("city", "") or ""),
+                        "state": str(first.get("state", "") or ""),
+                        "zip": str(first.get("zip", "") or ""),
+                        "total_weight": f"{total_w:.1f}",
+                    }
                 )
-            self.app.set_status(f"Loaded {len(grouped)} shipments.")
+            self._all_shipment_rows = collected_rows
+            self._refresh_salesperson_filter_options()
+            shown = self._render_shipments()
+            self.app.set_status(f"Loaded {len(grouped)} shipments (showing {shown}).")
 
         self.app.run_async(do, ok)
+
+    def _extract_salesperson(self, row: dict) -> str:
+        value = _row_get_any(
+            row,
+            "salesperson",
+            "salesPerson",
+            "salesman",
+            "salesMan",
+            "salesperson_name",
+            "salesPersonName",
+            "salesman_name",
+            "salesmanName",
+            "csr",
+            "csr_name",
+        )
+        return str(value or "").strip()
+
+    def _salesperson_for_ship(self, ship_num: str) -> str:
+        try:
+            so_rows = self.app.fb.data_query(queries.so_sql_for(ship_num))
+        except Exception:
+            return ""
+        if not so_rows:
+            return ""
+        return self._extract_salesperson(so_rows[0] or {})
+
+    def _status_text_and_tags_for_ship(self, ship_num: str) -> tuple[str, tuple[str, ...]]:
+        if ship_num in self.app.synapse_sent_shipments:
+            return "SENT", ("synapse_sent",)
+        if ship_num in self.app.synapse_failed_shipments:
+            return "FAILED", ("synapse_failed",)
+        return "", ()
+
+    def _refresh_salesperson_filter_options(self):
+        names = sorted(
+            {
+                str(r.get("salesperson") or "").strip()
+                for r in self._all_shipment_rows
+                if str(r.get("salesperson") or "").strip()
+            }
+        )
+        values = ("All Salespeople", *names)
+        current = str(self.salesperson_filter_var.get() or "").strip()
+        self.salesperson_filter.config(values=values)
+        if current not in values:
+            self.salesperson_filter_var.set("All Salespeople")
+
+    def _render_shipments(self) -> int:
+        for row_id in self.tree.get_children():
+            self.tree.delete(row_id)
+
+        selected = str(self.salesperson_filter_var.get() or "").strip()
+        shown = 0
+        for row in self._all_shipment_rows:
+            salesperson = str(row.get("salesperson") or "").strip()
+            if selected and selected != "All Salespeople" and salesperson != selected:
+                continue
+            ship_num = str(row.get("ship_num") or "")
+            status_text, tags = self._status_text_and_tags_for_ship(ship_num)
+            self.tree.insert(
+                "",
+                "end",
+                iid=ship_num,
+                values=(
+                    ship_num,
+                    salesperson,
+                    row.get("city", ""),
+                    row.get("state", ""),
+                    row.get("zip", ""),
+                    row.get("total_weight", ""),
+                    status_text,
+                ),
+                tags=tags,
+            )
+            shown += 1
+        return shown
 
     def mark_synapse_sent(self, ship_num: str):
         self.app.synapse_sent_shipments.add(ship_num)
