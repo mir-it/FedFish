@@ -3,22 +3,36 @@ PACKED_STATUS_ID = 20
 
 SHIPMENTS_SQL = f"""
 SELECT
-    ship.num AS ship_num,
-    ship.shipToCity AS city,
-    stateconst.code AS state,
-    ship.shipToZip AS zip,
+    so.num AS ship_num,
+    so.*,
+    COALESCE(ship.shipToCity, '') AS city,
+    COALESCE(stateconst.code, '') AS state,
+    COALESCE(ship.shipToZip, '') AS zip,
     shipcarton.freightweight AS weight,
     shipcarton.len AS length,
     shipcarton.width AS width,
     shipcarton.height AS height,
     lg.name AS location_group
-FROM ship
-JOIN shipcarton ON ship.id = shipcarton.shipId
-JOIN locationgroup lg ON ship.locationGroupId = lg.id
-JOIN stateconst ON ship.shipToStateId = stateconst.id
-WHERE ship.statusId = {PACKED_STATUS_ID}
+FROM so
+JOIN locationgroup lg ON so.locationGroupId = lg.id
+LEFT JOIN ship ON ship.id = (
+    SELECT s.id
+    FROM ship s
+    WHERE s.soId = so.id
+      AND s.statusId = {PACKED_STATUS_ID}
+    ORDER BY s.id DESC
+    LIMIT 1
+)
+LEFT JOIN shipcarton ON ship.id = shipcarton.shipId
+LEFT JOIN stateconst ON ship.shipToStateId = stateconst.id
+WHERE EXISTS (
+    SELECT 1
+    FROM ship sx
+    WHERE sx.soId = so.id
+      AND sx.statusId = {PACKED_STATUS_ID}
+)
   AND lg.name = '{LOCATION_GROUP}'
-ORDER BY ship.num
+ORDER BY so.num
 """
 
 SHIPMENT_ITEMS_SQL_TEMPLATE = f"""
@@ -66,14 +80,14 @@ SELECT
     uom.code AS uom
 FROM ship
 JOIN so ON ship.soId = so.id
-JOIN locationgroup lg ON ship.locationGroupId = lg.id
+JOIN locationgroup lg ON so.locationGroupId = lg.id
 JOIN stateconst ON ship.shipToStateId = stateconst.id
 JOIN soitem ON so.id = soitem.soId
 JOIN product ON soitem.productId = product.id
 JOIN uom ON soitem.uomId = uom.id
 WHERE ship.statusId = {PACKED_STATUS_ID}
   AND lg.name = '{LOCATION_GROUP}'
-  AND ship.num = '{{ship_num}}'
+  AND so.num = '{{ship_num}}'
 ORDER BY product.num
 """
 
@@ -86,7 +100,14 @@ def items_sql_for(ship_num: str) -> str:
 SHIP_SQL_TEMPLATE = """
 SELECT *
 FROM ship
-WHERE num = '{ship_num}'
+WHERE soId = (
+    SELECT id
+    FROM so
+    WHERE num = '{ship_num}'
+    LIMIT 1
+)
+  AND statusId = {PACKED_STATUS_ID}
+ORDER BY id DESC
 LIMIT 1
 """
 
@@ -94,12 +115,7 @@ LIMIT 1
 SO_SQL_TEMPLATE = """
 SELECT *
 FROM so
-WHERE id = (
-    SELECT soId
-    FROM ship
-    WHERE num = '{ship_num}'
-    LIMIT 1
-)
+WHERE num = '{ship_num}'
 LIMIT 1
 """
 
@@ -122,7 +138,7 @@ LIMIT 1
 
 def ship_sql_for(ship_num: str) -> str:
     safe = ship_num.replace("'", "''")
-    return SHIP_SQL_TEMPLATE.format(ship_num=safe)
+    return SHIP_SQL_TEMPLATE.format(ship_num=safe, PACKED_STATUS_ID=PACKED_STATUS_ID)
 
 
 def so_sql_for(ship_num: str) -> str:

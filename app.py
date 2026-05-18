@@ -541,7 +541,7 @@ class ShipmentsFrame(ttk.Frame):
 
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
-        ttk.Label(top, text="Packed Shipments", font=("TkDefaultFont", 14, "bold")).pack(side="left")
+        ttk.Label(top, text="Sales Order Shipments", font=("TkDefaultFont", 14, "bold")).pack(side="left")
         ttk.Label(top, text="Salesperson:").pack(side="left", padx=(16, 6))
         self.salesperson_filter_var = tk.StringVar(value="All Salespeople")
         self.salesperson_filter = ttk.Combobox(
@@ -586,13 +586,10 @@ class ShipmentsFrame(ttk.Frame):
         self.app.set_status("Loading shipments...")
 
         def do():
-            return self.app.fb.data_query(queries.SHIPMENTS_SQL)
-
-        def ok(rows):
+            rows = self.app.fb.data_query(queries.SHIPMENTS_SQL)
             grouped: dict[str, list[dict]] = {}
             for r in rows:
                 grouped.setdefault(r["ship_num"], []).append(r)
-            self.app.shipments_by_num = grouped
             collected_rows: list[dict] = []
             for num, pallets in grouped.items():
                 first = pallets[0]
@@ -600,13 +597,18 @@ class ShipmentsFrame(ttk.Frame):
                 collected_rows.append(
                     {
                         "ship_num": str(num),
-                        "salesperson": self._salesperson_for_ship(str(num)),
+                        "salesperson": self._extract_salesperson(first),
                         "city": str(first.get("city", "") or ""),
                         "state": str(first.get("state", "") or ""),
                         "zip": str(first.get("zip", "") or ""),
                         "total_weight": f"{total_w:.1f}",
                     }
                 )
+            return grouped, collected_rows
+
+        def ok(payload):
+            grouped, collected_rows = payload
+            self.app.shipments_by_num = grouped
             self._all_shipment_rows = collected_rows
             self._refresh_salesperson_filter_options()
             shown = self._render_shipments()
@@ -629,15 +631,6 @@ class ShipmentsFrame(ttk.Frame):
             "csr_name",
         )
         return str(value or "").strip()
-
-    def _salesperson_for_ship(self, ship_num: str) -> str:
-        try:
-            so_rows = self.app.fb.data_query(queries.so_sql_for(ship_num))
-        except Exception:
-            return ""
-        if not so_rows:
-            return ""
-        return self._extract_salesperson(so_rows[0] or {})
 
     def _status_text_and_tags_for_ship(self, ship_num: str) -> tuple[str, tuple[str, ...]]:
         if ship_num in self.app.synapse_sent_shipments:

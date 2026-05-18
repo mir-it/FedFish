@@ -10,8 +10,8 @@ def _get(name: str, default: str = "") -> str:
 
 FB_HOST = _get("FB_HOST", "192.168.0.132")
 FB_PORT = _get("FB_PORT", "80")
-FB_USERNAME = _get("FB_USERNAME", "admin")
-FB_PASSWORD = _get("FB_PASSWORD", "M@rbella567%")
+FB_USERNAME = _get("FB_USERNAME", "bayel_nj")
+FB_PASSWORD = _get("FB_PASSWORD", "Tile2026@")
 
 SHIPPER_CITY = _get("SHIPPER_CITY", "TAMPA")
 SHIPPER_STATE = _get("SHIPPER_STATE", "FL")
