@@ -75,6 +75,7 @@ SELECT
         ''
     ) AS tracking,
     soitem.id AS order_index,
+    COALESCE(soitem.note, '') AS soitem_note,
     soitem.dateScheduledFulfillment AS date_scheduled_fulfillment,
     soitem.qtyOrdered AS qty,
     uom.code AS uom

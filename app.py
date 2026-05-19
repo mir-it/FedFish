@@ -764,7 +764,7 @@ class ShipmentsFrame(ttk.Frame):
                         reviewed,
                         scac,
                         ship_type_override=ship_type,
-                        hdr_instructions=detail_frame._resolved_hdr_instructions(ship_num, ctx),
+                        hdr_instructions=detail_frame._resolved_hdr_instructions(ship_num, ctx, rows),
                     )
                     client.create_order(order_data)
                     results.append({"ship_num": ship_num, "ok": True, "carrier_name": carrier_name, "scac": scac, "ship_type": ship_type})
@@ -923,7 +923,7 @@ class PalletDetailFrame(ttk.Frame):
             rows, ctx = payload
             self.app.current_items = rows
             self.app.current_order_context = ctx
-            self._set_instructions_text(self._resolved_hdr_instructions(num, ctx))
+            self._set_instructions_text(self._resolved_hdr_instructions(num, ctx, rows))
             for r in rows:
                 item_num = str(r.get("item_num", "") or "")
                 if self._should_exclude_item(item_num):
@@ -987,15 +987,43 @@ class PalletDetailFrame(ttk.Frame):
             "customer": customer_row,
         }
 
-    def _ship_note_instructions(self, ctx: dict) -> str:
-        ship_row = ctx.get("ship", {}) or {}
-        return str(_row_get_any(ship_row, "note", "notes") or "").strip()
+    def _so_note_instructions(self, ctx: dict) -> str:
+        so_row = ctx.get("so", {}) or {}
+        return str(
+            _row_get_any(
+                so_row,
+                "note",
+                "notes",
+                "memo",
+                "customerMemo",
+                "customer_note",
+            )
+            or ""
+        ).strip()
 
-    def _resolved_hdr_instructions(self, ship_num: str, ctx: dict) -> str:
+    def _soitem_note_instructions(self, rows: list[dict]) -> str:
+        for row in rows:
+            text = str(
+                _row_get_any(
+                    row,
+                    "soitem_note",
+                    "soitemNote",
+                    "note",
+                )
+                or ""
+            ).strip()
+            if text:
+                return text
+        return ""
+
+    def _resolved_hdr_instructions(self, ship_num: str, ctx: dict, rows: list[dict] | None = None) -> str:
         manual = str(self.app.hdr_instructions_by_ship.get(ship_num, "") or "")
         if manual.strip():
             return manual
-        return self._ship_note_instructions(ctx)
+        soitem_note = self._soitem_note_instructions(rows or [])
+        if soitem_note:
+            return soitem_note
+        return self._so_note_instructions(ctx)
 
     def _ship_date_from_soitem_rows(self, rows: list[dict]) -> str:
         for r in rows:
