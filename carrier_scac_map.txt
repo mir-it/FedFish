@@ -5,6 +5,6 @@ fedex	FEDM
 fedex freight	FXSW
 freight	FXSW
 mcc	MCCQ
-roadrunner	9999
+roadrunner	RDFS
 saia	SAIA
 ups	UPSM

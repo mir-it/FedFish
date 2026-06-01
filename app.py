@@ -264,8 +264,34 @@ def _apply_header_field_limits(header: dict) -> dict:
 
 
 SENT_SHIPMENTS_FILE = Path(__file__).with_name("synapse_sent_shipments.txt")
+SYNAPSE_ORDER_INFO_FILE = Path(__file__).with_name("synapse_order_info_map.txt")
 CARRIER_SCAC_MAP_FILE = Path(__file__).with_name("carrier_scac_map.txt")
 CARRIER_SHIP_TYPE_MAP_FILE = Path(__file__).with_name("carrier_ship_type_map.txt")
+
+
+def _extract_synapse_order_info_fields(response: dict | None) -> dict | None:
+    if not isinstance(response, dict) or response.get("error"):
+        return None
+    orderid = response.get("orderid")
+    shipid = response.get("shipid")
+    if orderid is None or shipid is None:
+        return None
+    return {
+        "orderid": int(orderid),
+        "shipid": int(shipid),
+        "reference": str(response.get("reference") or "").strip(),
+        "po": str(response.get("po") or "").strip(),
+    }
+
+
+def _order_info_payload_from_fields(fields: dict) -> dict:
+    return {
+        "orderid": fields["orderid"],
+        "shipid": fields["shipid"],
+        "custid": "MIRMOS",
+        "po": fields.get("po") or "",
+        "reference": fields.get("reference") or "",
+    }
 
 
 class App(tk.Tk):
@@ -286,6 +312,7 @@ class App(tk.Tk):
         self.synapse_failed_shipments: dict[str, str] = {}
         self.carrier_scac_map: dict[str, str] = self._load_carrier_scac_map()
         self.carrier_ship_type_map: dict[str, str] = self._load_carrier_ship_type_map()
+        self.synapse_order_info_by_ship: dict[str, dict] = self._load_synapse_order_info_map()
 
         self.container = ttk.Frame(self)
         self.container.pack(fill="both", expand=True)
@@ -466,6 +493,64 @@ class App(tk.Tk):
         self.carrier_ship_type_map[carrier_norm] = ship_type_norm
         self.save_carrier_ship_type_map()
 
+    def _load_synapse_order_info_map(self) -> dict[str, dict]:
+        if not SYNAPSE_ORDER_INFO_FILE.exists():
+            return {}
+        try:
+            lines = SYNAPSE_ORDER_INFO_FILE.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return {}
+        out: dict[str, dict] = {}
+        for line in lines:
+            text = line.strip()
+            if not text or "\t" not in text:
+                continue
+            ship_num, raw_json = text.split("\t", 1)
+            ship_key = ship_num.strip()
+            if not ship_key:
+                continue
+            try:
+                fields = json.loads(raw_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(fields, dict) and fields.get("orderid") is not None and fields.get("shipid") is not None:
+                out[ship_key] = fields
+        return out
+
+    def save_synapse_order_info_map(self):
+        lines = []
+        for ship_num in sorted(self.synapse_order_info_by_ship):
+            fields = self.synapse_order_info_by_ship.get(ship_num) or {}
+            if fields.get("orderid") is None or fields.get("shipid") is None:
+                continue
+            lines.append(f"{ship_num}\t{json.dumps(fields, separators=(',', ':'))}")
+        payload = "\n".join(lines)
+        if payload:
+            payload += "\n"
+        try:
+            SYNAPSE_ORDER_INFO_FILE.write_text(payload, encoding="utf-8")
+        except Exception as e:
+            self.set_status(f"Warning: failed saving Synapse order-info map ({e}).")
+
+    def get_synapse_order_info(self, ship_num: str) -> dict | None:
+        ship_key = str(ship_num or "").strip()
+        if not ship_key:
+            return None
+        fields = self.synapse_order_info_by_ship.get(ship_key)
+        if fields:
+            return dict(fields)
+        return None
+
+    def remember_synapse_order_info(self, ship_num: str, response: dict | None):
+        ship_key = str(ship_num or "").strip()
+        fields = _extract_synapse_order_info_fields(response)
+        if not ship_key or not fields:
+            return
+        if self.synapse_order_info_by_ship.get(ship_key) == fields:
+            return
+        self.synapse_order_info_by_ship[ship_key] = fields
+        self.save_synapse_order_info_map()
+
 
 class LoginFrame(ttk.Frame):
     def __init__(self, parent, app: App):
@@ -553,7 +638,11 @@ class ShipmentsFrame(ttk.Frame):
         )
         self.salesperson_filter.pack(side="left")
         self.salesperson_filter.bind("<<ComboboxSelected>>", lambda _e: self._render_shipments())
-        ttk.Button(top, text="Send All", command=self._send_all_synapse).pack(side="right")
+        ttk.Label(top, text="Search Ship #:").pack(side="left", padx=(16, 6))
+        self.ship_search_var = tk.StringVar(value="")
+        self.ship_search_entry = ttk.Entry(top, textvariable=self.ship_search_var, width=18)
+        self.ship_search_entry.pack(side="left")
+        self.ship_search_var.trace_add("write", lambda *_: self._render_shipments())
         ttk.Button(top, text="Send Selected", command=self._send_selected_synapse).pack(side="right", padx=(0, 8))
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
@@ -571,6 +660,7 @@ class ShipmentsFrame(ttk.Frame):
         self.tree.tag_configure("synapse_failed", background="#f8d7da")
         self.tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.tree.bind("<Double-1>", lambda e: self._view_selected())
+        self.tree.bind("<Button-3>", self._on_shipments_tree_right_click)
 
         bottom = ttk.Frame(self, padding=(10, 0, 10, 10))
         bottom.pack(fill="x")
@@ -579,6 +669,29 @@ class ShipmentsFrame(ttk.Frame):
     def on_show(self):
         if not self.tree.get_children():
             self.refresh()
+
+    def _on_shipments_tree_right_click(self, event):
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+        if self.tree.identify_column(event.x) != "#1":
+            return
+        values = self.tree.item(row_id, "values") or ()
+        ship_text = str(values[0] if values else row_id).strip()
+        if not ship_text:
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Copy", command=lambda t=ship_text: self._copy_ship_num_text(t))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_ship_num_text(self, text: str):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update_idletasks()
+        self.app.set_status(f"Copied ship #: {text}")
 
     def refresh(self):
         for row in self.tree.get_children():
@@ -658,12 +771,15 @@ class ShipmentsFrame(ttk.Frame):
             self.tree.delete(row_id)
 
         selected = str(self.salesperson_filter_var.get() or "").strip()
+        search = str(self.ship_search_var.get() or "").strip().lower()
         shown = 0
         for row in self._all_shipment_rows:
             salesperson = str(row.get("salesperson") or "").strip()
             if selected and selected != "All Salespeople" and salesperson != selected:
                 continue
             ship_num = str(row.get("ship_num") or "")
+            if search and search not in ship_num.lower():
+                continue
             status_text, tags = self._status_text_and_tags_for_ship(ship_num)
             self.tree.insert(
                 "",
@@ -706,16 +822,6 @@ class ShipmentsFrame(ttk.Frame):
             current_values += [""] * ((self._status_col_idx + 1) - len(current_values))
         current_values[self._status_col_idx] = "FAILED"
         self.tree.item(ship_num, values=tuple(current_values), tags=("synapse_failed",))
-
-    def _send_all_synapse(self):
-        ship_nums = [
-            num for num in self.app.shipments_by_num.keys()
-            if num not in self.app.synapse_sent_shipments
-        ]
-        if not ship_nums:
-            messagebox.showinfo("Nothing to send", "All packed shipments are already marked SENT.")
-            return
-        self._send_shipments_to_synapse(ship_nums, mode_label="all")
 
     def _send_selected_synapse(self):
         selected = list(self.tree.selection())
@@ -766,7 +872,8 @@ class ShipmentsFrame(ttk.Frame):
                         ship_type_override=ship_type,
                         hdr_instructions=detail_frame._resolved_hdr_instructions(ship_num, ctx, rows),
                     )
-                    client.create_order(order_data)
+                    response = client.create_order(order_data)
+                    self.app.remember_synapse_order_info(ship_num, response)
                     results.append({"ship_num": ship_num, "ok": True, "carrier_name": carrier_name, "scac": scac, "ship_type": ship_type})
                 except Exception as e:
                     results.append({"ship_num": ship_num, "ok": False, "error": str(e)})
@@ -855,6 +962,13 @@ class PalletDetailFrame(ttk.Frame):
         actions.pack(fill="x")
         self.synapse_btn = ttk.Button(actions, text="Create Synapse Order", command=self._create_synapse_order)
         self.synapse_btn.pack(side="left")
+        self.order_info_btn = ttk.Button(
+            actions,
+            text="Send Order Info",
+            command=self._send_order_info,
+            state="disabled",
+        )
+        self.order_info_btn.pack(side="left", padx=(8, 0))
         self.toggle_raw_btn = ttk.Button(
             actions,
             text="Show Synapse response",
@@ -880,6 +994,8 @@ class PalletDetailFrame(ttk.Frame):
         self._raw_visible = False
         self._last_synapse_response: dict | None = None
         self._last_synapse_payload: dict | None = None
+        self._last_order_info_payload: dict | None = None
+        self._last_order_info_response: dict | None = None
 
     def on_show(self):
         num = self.app.current_ship_num
@@ -910,6 +1026,10 @@ class PalletDetailFrame(ttk.Frame):
         self._hide_raw()
         self._last_synapse_response = None
         self._last_synapse_payload = None
+        self._last_order_info_payload = None
+        self._last_order_info_response = None
+        self._update_order_info_btn_state()
+        self._update_raw_btn_state()
         self.app.current_order_context = {}
 
         self.app.set_status(f"Loading items for {num}...")
@@ -1142,7 +1262,7 @@ class PalletDetailFrame(ttk.Frame):
         if not po_number:
             raise ValueError("This shipment has no PO number in Fishbowl.")
         ship_num_value = _synapse_reference_from_ship_num(
-            _row_get_any(ship_row, "num") or self.app.current_ship_num
+            _row_get_any(so_row, "num") or self.app.current_ship_num
         )
 
         ship_to_name = str(_row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or "").strip() or "SHIP TO"
@@ -1272,7 +1392,7 @@ class PalletDetailFrame(ttk.Frame):
             messagebox.showerror("Missing PO", "This shipment has no PO number in Fishbowl.")
             return
         ship_num_value = _synapse_reference_from_ship_num(
-            _row_get_any(ship_row, "num") or ship_num
+            _row_get_any(so_row, "num") or ship_num
         )
 
         ship_to_name = str(
@@ -1444,13 +1564,15 @@ class PalletDetailFrame(ttk.Frame):
             self.synapse_btn.config(state="normal")
             self._last_synapse_response = result.get("response")
             self._last_synapse_payload = result.get("sent_payload")
-            self.toggle_raw_btn.config(state="normal")
             self.app.remember_scac_for_carrier(carrier_name, carrier)
             self.app.remember_ship_type_for_carrier(carrier_name, ship_type)
             if self.app.current_ship_num:
+                self.app.remember_synapse_order_info(self.app.current_ship_num, self._last_synapse_response)
                 shipments_frame = self.app.frames.get("shipments")
                 if isinstance(shipments_frame, ShipmentsFrame):
                     shipments_frame.mark_synapse_sent(self.app.current_ship_num)
+            self._update_order_info_btn_state()
+            self._update_raw_btn_state()
             self.app.set_status("Synapse order created.")
             messagebox.showinfo("Synapse", "Order created successfully in Synapse.")
 
@@ -1459,7 +1581,7 @@ class PalletDetailFrame(ttk.Frame):
             self._last_synapse_response = {"error": str(e)}
             if isinstance(e, SynapseCreateOrderError):
                 self._last_synapse_payload = e.sent_payload
-            self.toggle_raw_btn.config(state="normal")
+            self._update_raw_btn_state()
             if self.app.current_ship_num:
                 shipments_frame = self.app.frames.get("shipments")
                 if isinstance(shipments_frame, ShipmentsFrame):
@@ -1567,17 +1689,98 @@ class PalletDetailFrame(ttk.Frame):
                 }
             )
 
+        ship_num = str(self.app.current_ship_num or "").strip()
+        order_info_enabled = bool(ship_num and self.app.get_synapse_order_info(ship_num))
         dlg = SynapseLinesDialog(
             self,
             rows,
             initial_scac=initial_scac,
             initial_ship_type=initial_ship_type,
             initial_shipment_terms=initial_shipment_terms,
+            order_info_enabled=order_info_enabled,
+            on_send_order_info=self._send_order_info if order_info_enabled else None,
         )
         self.wait_window(dlg)
         if dlg.result is None:
             return None
         return dlg.result, dlg.scac, dlg.ship_type, dlg.shipment_terms
+
+    def _order_info_fields_for_current_ship(self) -> dict | None:
+        ship_num = str(self.app.current_ship_num or "").strip()
+        if ship_num:
+            stored = self.app.get_synapse_order_info(ship_num)
+            if stored:
+                return stored
+        return _extract_synapse_order_info_fields(self._last_synapse_response)
+
+    def _update_order_info_btn_state(self):
+        enabled = self._order_info_fields_for_current_ship() is not None
+        self.order_info_btn.config(state="normal" if enabled else "disabled")
+
+    def _update_raw_btn_state(self):
+        has_data = any(
+            (
+                self._last_synapse_response,
+                self._last_synapse_payload,
+                self._last_order_info_response,
+                self._last_order_info_payload,
+                self._order_info_fields_for_current_ship(),
+            )
+        )
+        self.toggle_raw_btn.config(state="normal" if has_data else "disabled")
+
+    def _send_order_info(self):
+        fields = self._order_info_fields_for_current_ship()
+        if not fields:
+            messagebox.showinfo(
+                "Order info unavailable",
+                "Create a Synapse order first so orderid, shipid, po, and reference are saved.",
+            )
+            return
+        if not config.SYNAPSE_USERNAME or not config.SYNAPSE_PASSWORD:
+            messagebox.showerror(
+                "Synapse not configured",
+                "Set SYNAPSE_USERNAME and SYNAPSE_PASSWORD in your .env (and restart the app).",
+            )
+            return
+
+        payload = _order_info_payload_from_fields(fields)
+        self._last_order_info_payload = payload
+        self.order_info_btn.config(state="disabled")
+        self.app.set_status("Sending Synapse order-info...")
+
+        def do():
+            client = SynapseClient(
+                SynapseConfig(
+                    base_url=config.SYNAPSE_BASE_URL,
+                    username=config.SYNAPSE_USERNAME,
+                    password=config.SYNAPSE_PASSWORD,
+                )
+            )
+            client.login()
+            return client.order_info(payload)
+
+        def ok(response):
+            self._last_order_info_response = response
+            self._update_order_info_btn_state()
+            self._update_raw_btn_state()
+            if not self._raw_visible:
+                self._show_raw()
+            else:
+                self._refresh_raw_text()
+            self.app.set_status("Synapse order-info sent.")
+            messagebox.showinfo("Synapse order-info", "Order info sent successfully.")
+
+        def err(e):
+            self._last_order_info_response = {"error": str(e)}
+            self._update_order_info_btn_state()
+            self._update_raw_btn_state()
+            if self._raw_visible:
+                self._refresh_raw_text()
+            messagebox.showerror("Synapse order-info error", str(e))
+            self.app.set_status("Synapse order-info failed.")
+
+        self.app.run_async(do, ok, err)
 
     def _toggle_raw(self):
         if self._raw_visible:
@@ -1585,15 +1788,25 @@ class PalletDetailFrame(ttk.Frame):
         else:
             self._show_raw()
 
+    def _raw_bundle(self) -> dict:
+        return {
+            "synapse_payload": self._last_synapse_payload,
+            "synapse_response": self._last_synapse_response,
+            "order_info_payload": self._last_order_info_payload,
+            "order_info_response": self._last_order_info_response,
+            "saved_order_info": self._order_info_fields_for_current_ship(),
+        }
+
+    def _refresh_raw_text(self):
+        self.raw_text.delete("1.0", "end")
+        self.raw_text.insert("1.0", json.dumps(self._raw_bundle(), indent=2, default=str))
+
     def _show_raw(self):
-        if self._last_synapse_response is None and self._last_synapse_payload is None:
+        bundle = self._raw_bundle()
+        if all(v is None for v in bundle.values()):
             return
         self.raw_text.pack(fill="both", expand=True)
         self.raw_text.delete("1.0", "end")
-        bundle = {
-            "synapse_payload": self._last_synapse_payload,
-            "synapse_response": self._last_synapse_response,
-        }
         self.raw_text.insert("1.0", json.dumps(bundle, indent=2, default=str))
         self.toggle_raw_btn.config(text="Hide Synapse response")
         self._raw_visible = True
@@ -1612,6 +1825,8 @@ class SynapseLinesDialog(tk.Toplevel):
         initial_scac: str = "",
         initial_ship_type: str = "",
         initial_shipment_terms: str = "",
+        order_info_enabled: bool = False,
+        on_send_order_info=None,
     ):
         super().__init__(parent)
         self.title("Review Synapse Order Lines")
@@ -1694,6 +1909,8 @@ class SynapseLinesDialog(tk.Toplevel):
         btns.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right")
         ttk.Button(btns, text="Send to Synapse", command=self._ok).pack(side="right", padx=(0, 8))
+        if order_info_enabled and on_send_order_info:
+            ttk.Button(btns, text="Send Order Info", command=on_send_order_info).pack(side="right", padx=(0, 8))
 
     def _on_double_click(self, event):
         row_id = self.tree.identify_row(event.y)

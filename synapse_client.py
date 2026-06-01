@@ -250,3 +250,22 @@ class SynapseClient:
         except ValueError:
             return {"status_code": resp.status_code, "text": resp.text}
 
+    def order_info(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST /api/orders/order-info with orderid, shipid, custid, po, reference."""
+        resp = self.session.post(
+            f"{self.cfg.base_url}/api/orders/order-info",
+            json=payload,
+            headers=self._xsrf_headers(),
+            timeout=60,
+        )
+        if resp.status_code >= 400:
+            try:
+                body: Any = resp.json()
+            except ValueError:
+                body = resp.text
+            raise ValueError(f"Synapse order-info failed ({resp.status_code}): {body}")
+        try:
+            return resp.json()
+        except ValueError:
+            return {"status_code": resp.status_code, "text": resp.text}
+
