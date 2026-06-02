@@ -17,6 +17,21 @@ if not defined PY_CMD (
     exit /b 1
 )
 
+REM Install dependencies if any are missing.
+if exist "requirements.txt" (
+    %PY_CMD% -c "import requests, dotenv" >nul 2>nul
+    if errorlevel 1 (
+        echo Installing dependencies from requirements.txt ...
+        %PY_CMD% -m pip install -r requirements.txt
+        if errorlevel 1 (
+            echo.
+            echo Failed to install dependencies from requirements.txt.
+            pause
+            exit /b 1
+        )
+    )
+)
+
 %PY_CMD% app.py
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" (
