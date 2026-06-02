@@ -1689,16 +1689,12 @@ class PalletDetailFrame(ttk.Frame):
                 }
             )
 
-        ship_num = str(self.app.current_ship_num or "").strip()
-        order_info_enabled = bool(ship_num and self.app.get_synapse_order_info(ship_num))
         dlg = SynapseLinesDialog(
             self,
             rows,
             initial_scac=initial_scac,
             initial_ship_type=initial_ship_type,
             initial_shipment_terms=initial_shipment_terms,
-            order_info_enabled=order_info_enabled,
-            on_send_order_info=self._send_order_info if order_info_enabled else None,
         )
         self.wait_window(dlg)
         if dlg.result is None:
@@ -1825,8 +1821,6 @@ class SynapseLinesDialog(tk.Toplevel):
         initial_scac: str = "",
         initial_ship_type: str = "",
         initial_shipment_terms: str = "",
-        order_info_enabled: bool = False,
-        on_send_order_info=None,
     ):
         super().__init__(parent)
         self.title("Review Synapse Order Lines")
@@ -1909,8 +1903,6 @@ class SynapseLinesDialog(tk.Toplevel):
         btns.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right")
         ttk.Button(btns, text="Send to Synapse", command=self._ok).pack(side="right", padx=(0, 8))
-        if order_info_enabled and on_send_order_info:
-            ttk.Button(btns, text="Send Order Info", command=on_send_order_info).pack(side="right", padx=(0, 8))
 
     def _on_double_click(self, event):
         row_id = self.tree.identify_row(event.y)
