@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,11 +64,12 @@ def normalize_uom(uom: str) -> str:
 def suggest_each_qty(qty_sf: float, coverage_sf_per_ea: float) -> tuple[int, bool]:
     """
     Returns (suggested_ea_qty, was_fractional).
-    If the conversion is fractional, we round UP and mark it fractional so the user can review.
+    The conversion is rounded to the nearest whole EA (halves round up), e.g.
+    41.76 / 0.535 = 78.06 -> 78. Fractional results are flagged so the user can review.
     """
     if coverage_sf_per_ea <= 0:
         raise ValueError("coverage_sf_per_ea must be > 0")
     raw = qty_sf / coverage_sf_per_ea
-    rounded = int(raw) if float(raw).is_integer() else int(raw) + 1
+    rounded = math.floor(raw + 0.5)
     return rounded, (not float(raw).is_integer())
 
