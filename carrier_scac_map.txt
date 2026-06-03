@@ -1,12 +1,5 @@
-customer's own carrier	CSPU
-daylight	DYLT
-estes express lines	EXLA
 fedex	FEDX
-fedex freight	FXSW
-freight	FXSW
-mcc	MCCQ
-roadrunner	RDFS
-saia	SAIA
-ups	UPSM
+ups	UPSN
 pitt ohio	PITM
+
 

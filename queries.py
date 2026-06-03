@@ -12,6 +12,14 @@ SELECT
     shipcarton.len AS length,
     shipcarton.width AS width,
     shipcarton.height AS height,
+    (
+        SELECT c.name
+        FROM shipcarton sc
+        LEFT JOIN carrier c ON c.id = sc.carrierId
+        WHERE sc.shipId = ship.id
+        ORDER BY sc.id
+        LIMIT 1
+    ) AS carrier_name,
     lg.name AS location_group
 FROM so
 JOIN locationgroup lg ON so.locationGroupId = lg.id

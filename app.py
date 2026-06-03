@@ -116,6 +116,19 @@ def _normalize_carrier_name(raw_name: str) -> str:
     return " ".join(str(raw_name or "").strip().lower().split())
 
 
+# Carrier-name keywords that should force shipment terms to 3RD (third party collect).
+SHIPMENT_TERMS_3RD_CARRIER_KEYWORDS: tuple[str, ...] = ("fedex", "ups")
+
+
+def _shipment_terms_from_carrier_name(raw_name: str) -> str:
+    name = str(raw_name or "").strip().lower()
+    if not name:
+        return ""
+    if any(k in name for k in SHIPMENT_TERMS_3RD_CARRIER_KEYWORDS):
+        return "3RD"
+    return ""
+
+
 SHIP_TYPE_BY_CARRIER_NAME_KEYWORDS: dict[str, tuple[str, ...]] = {
     # Edit this mapping as needed to add more carrier-name patterns.
     "S": ("ups ground",),
@@ -192,6 +205,76 @@ def _shipment_terms_code_from_label(label: str) -> str:
     code = text.split(" - ", 1)[0].strip().upper()
     for option_code, _ in SHIPMENT_TERMS_OPTIONS:
         if code == option_code:
+            return option_code
+    return ""
+
+
+# Carrier-specific delivery services -> header "delivery_service" code.
+# Only offered when the carrier matches one of these mappings.
+FEDEX_DELIVERY_SERVICE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("1", "FedEx Priority Overnight"),
+    ("2", "FedEx Standard Overnight"),
+    ("3", "FedEx 2Day"),
+    ("4", "FedEx 1Day Freight"),
+    ("5", "FedEx 2Day Freight"),
+    ("6", "FedEx First Overnight"),
+    ("7", "FedEx Express Saver - 3 day serv"),
+    ("8", "FedEx 3Day Freight"),
+    ("10", "FedEx 2Day AM"),
+    ("11", "FedEx First Overnight"),
+    ("90", "FedEx Ground House - Residential"),
+    ("92", "FedEx Ground Service"),
+    ("INT1", "FedEx International PRIORITY"),
+    ("INT2", "FedEx International ECONOMY"),
+    ("INTR", "FedEx International GROUND"),
+)
+UPS_DELIVERY_SERVICE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("2AIR", "2nd Day Air AM"),
+    ("2DAY", "2nd Day Air"),
+    ("3DAY", "3 Day Select"),
+    ("EXPR", "UPS Express - 10AM"),
+    ("GRND", "Ground"),
+    ("IEXP", "Worldwide Express"),
+    ("ISTD", "Standard"),
+    ("ISTN", "Worldwide Standard"),
+    ("ISVR", "Worldwide Saver (Express)"),
+    ("IXPD", "Worldwide Expedited"),
+    ("IXPL", "Worldwide Express Plus"),
+    ("NDAM", "Next Day Air Early AM"),
+    ("NDAS", "Next Day Air Saver"),
+    ("NDAY", "Next Day Air"),
+)
+DELIVERY_SERVICE_NONE_LABEL = "(none)"
+
+
+def _delivery_service_options_for_carrier(raw_name: str) -> tuple[tuple[str, str], ...]:
+    name = str(raw_name or "").strip().lower()
+    if not name:
+        return ()
+    if "fedex" in name:
+        return FEDEX_DELIVERY_SERVICE_OPTIONS
+    if "ups" in name:
+        return UPS_DELIVERY_SERVICE_OPTIONS
+    return ()
+
+
+def _delivery_service_label_from_code(code: str, options: tuple[tuple[str, str], ...]) -> str:
+    normalized = str(code or "").strip().upper()
+    if not normalized:
+        return DELIVERY_SERVICE_NONE_LABEL
+    for option_code, desc in options:
+        if normalized == option_code.upper():
+            return f"{option_code} - {desc}"
+    return DELIVERY_SERVICE_NONE_LABEL
+
+
+def _delivery_service_code_from_label(label: str, options: tuple[tuple[str, str], ...]) -> str:
+    text = str(label or "").strip()
+    if not text or text == DELIVERY_SERVICE_NONE_LABEL:
+        return ""
+    code = text.split(" - ", 1)[0].strip()
+    for option_code, _ in options:
+        if code.upper() == option_code.upper():
             return option_code
     return ""
 
@@ -647,8 +730,8 @@ class ShipmentsFrame(ttk.Frame):
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
-        cols = ("ship_num", "salesperson", "city", "state", "zip", "total_weight", "synapse_status")
-        headers = ("Ship #", "Salesperson", "City", "State", "Zip", "Total Weight (lb)", "Synapse")
+        cols = ("ship_num", "salesperson", "city", "state", "zip", "carrier", "synapse_status")
+        headers = ("Ship #", "Salesperson", "City", "State", "Zip", "Carrier", "Synapse")
         self._status_col_idx = len(cols) - 1
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
         for c, h in zip(cols, headers):
@@ -706,7 +789,10 @@ class ShipmentsFrame(ttk.Frame):
             collected_rows: list[dict] = []
             for num, pallets in grouped.items():
                 first = pallets[0]
-                total_w = sum(float(p.get("weight") or 0) for p in pallets)
+                carrier_name = next(
+                    (str(p.get("carrier_name") or "").strip() for p in pallets if str(p.get("carrier_name") or "").strip()),
+                    "",
+                )
                 collected_rows.append(
                     {
                         "ship_num": str(num),
@@ -714,7 +800,7 @@ class ShipmentsFrame(ttk.Frame):
                         "city": str(first.get("city", "") or ""),
                         "state": str(first.get("state", "") or ""),
                         "zip": str(first.get("zip", "") or ""),
-                        "total_weight": f"{total_w:.1f}",
+                        "carrier": carrier_name,
                     }
                 )
             return grouped, collected_rows
@@ -791,7 +877,7 @@ class ShipmentsFrame(ttk.Frame):
                     row.get("city", ""),
                     row.get("state", ""),
                     row.get("zip", ""),
-                    row.get("total_weight", ""),
+                    row.get("carrier", ""),
                     status_text,
                 ),
                 tags=tags,
@@ -1300,6 +1386,8 @@ class PalletDetailFrame(ttk.Frame):
             shipment_terms = _normalize_terms(shipment_terms_override) or shipment_terms
 
         carrier_name = next((str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()), "")
+        if not shipment_terms_override and _shipment_terms_from_carrier_name(carrier_name):
+            shipment_terms = "3RD"
         ship_type = str(ship_type_override or self.app.resolve_ship_type_for_carrier(carrier_name) or config.SYNAPSE_SHIP_TYPE).strip().upper()
         if ship_type not in VALID_SHIP_TYPES:
             ship_type = config.SYNAPSE_SHIP_TYPE
@@ -1428,17 +1516,20 @@ class PalletDetailFrame(ttk.Frame):
         if not initial_shipment_terms:
             third_party_flag = _to_boolish(_row_get_any(so_row, "isThirdParty", "thirdPartyBilling", "thirdParty"))
             initial_shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
+        if _shipment_terms_from_carrier_name(carrier_name):
+            initial_shipment_terms = "3RD"
 
         reviewed_payload = self._review_synapse_lines(
             review_lines,
             initial_scac=initial_scac,
             initial_ship_type=initial_ship_type,
             initial_shipment_terms=initial_shipment_terms,
+            carrier_name=carrier_name,
         )
         if reviewed_payload is None:
             self.app.set_status("Synapse order cancelled.")
             return
-        reviewed, carrier, ship_type, shipment_terms = reviewed_payload
+        reviewed, carrier, ship_type, shipment_terms, delivery_service = reviewed_payload
 
         details = [
             {
@@ -1529,6 +1620,8 @@ class PalletDetailFrame(ttk.Frame):
                     "bill_to_country_code": bill_to_country_code,
                 }
             )
+        if delivery_service:
+            order_data["header"]["delivery_service"] = delivery_service
         order_data["header"] = _apply_header_field_limits(order_data["header"])
         instructions_text = str(self.instructions_var.get() or "").strip()
         if instructions_text:
@@ -1541,7 +1634,7 @@ class PalletDetailFrame(ttk.Frame):
                 "instructions": instructions_text[:255],
             }
 
-        self._last_synapse_payload = None
+        self._last_synapse_payload = order_data
         self.synapse_btn.config(state="disabled")
         self.app.set_status("Creating Synapse order...")
 
@@ -1557,7 +1650,7 @@ class PalletDetailFrame(ttk.Frame):
             response = client.create_order(order_data)
             return {
                 "response": response,
-                "sent_payload": client.last_payload_sent,
+                "sent_payload": client.last_payload_sent or order_data,
             }
 
         def ok(result):
@@ -1579,7 +1672,7 @@ class PalletDetailFrame(ttk.Frame):
         def err(e):
             self.synapse_btn.config(state="normal")
             self._last_synapse_response = {"error": str(e)}
-            if isinstance(e, SynapseCreateOrderError):
+            if isinstance(e, SynapseCreateOrderError) and e.sent_payload is not None:
                 self._last_synapse_payload = e.sent_payload
             self._update_raw_btn_state()
             if self.app.current_ship_num:
@@ -1631,7 +1724,8 @@ class PalletDetailFrame(ttk.Frame):
         initial_scac: str,
         initial_ship_type: str,
         initial_shipment_terms: str,
-    ) -> tuple[list[dict], str, str, str] | None:
+        carrier_name: str = "",
+    ) -> tuple[list[dict], str, str, str, str] | None:
         coverage_map = {}
         if config.PRODUCT_COVERAGE_CSV:
             try:
@@ -1695,11 +1789,12 @@ class PalletDetailFrame(ttk.Frame):
             initial_scac=initial_scac,
             initial_ship_type=initial_ship_type,
             initial_shipment_terms=initial_shipment_terms,
+            delivery_service_options=_delivery_service_options_for_carrier(carrier_name),
         )
         self.wait_window(dlg)
         if dlg.result is None:
             return None
-        return dlg.result, dlg.scac, dlg.ship_type, dlg.shipment_terms
+        return dlg.result, dlg.scac, dlg.ship_type, dlg.shipment_terms, dlg.delivery_service
 
     def _order_info_fields_for_current_ship(self) -> dict | None:
         ship_num = str(self.app.current_ship_num or "").strip()
@@ -1821,10 +1916,12 @@ class SynapseLinesDialog(tk.Toplevel):
         initial_scac: str = "",
         initial_ship_type: str = "",
         initial_shipment_terms: str = "",
+        delivery_service_options: tuple[tuple[str, str], ...] = (),
+        initial_delivery_service: str = "",
     ):
         super().__init__(parent)
         self.title("Review Synapse Order Lines")
-        self.geometry("900x420")
+        self.geometry("960x420")
         self.resizable(True, True)
         self.transient(parent.winfo_toplevel())
         self.grab_set()
@@ -1833,6 +1930,9 @@ class SynapseLinesDialog(tk.Toplevel):
         self.scac: str = ""
         self.ship_type: str = ""
         self.shipment_terms: str = ""
+        self.delivery_service: str = ""
+        self._delivery_service_options = tuple(delivery_service_options or ())
+        self._delivery_service_enabled = bool(self._delivery_service_options)
         self._rows = rows
 
         ttk.Label(
@@ -1868,6 +1968,33 @@ class SynapseLinesDialog(tk.Toplevel):
             values=tuple(f"{code} - {desc}" for code, desc in SHIPMENT_TERMS_OPTIONS),
             state="readonly",
         ).pack(side="left")
+
+        delivery_row = ttk.Frame(self)
+        delivery_row.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(delivery_row, text="Delivery Service:").pack(side="left")
+        self.delivery_service_var = tk.StringVar(
+            value=_delivery_service_label_from_code(initial_delivery_service, self._delivery_service_options)
+            if self._delivery_service_enabled
+            else DELIVERY_SERVICE_NONE_LABEL
+        )
+        delivery_values = (
+            DELIVERY_SERVICE_NONE_LABEL,
+            *(f"{code} - {desc}" for code, desc in self._delivery_service_options),
+        )
+        self.delivery_service_combo = ttk.Combobox(
+            delivery_row,
+            textvariable=self.delivery_service_var,
+            width=40,
+            values=delivery_values,
+            state="readonly" if self._delivery_service_enabled else "disabled",
+        )
+        self.delivery_service_combo.pack(side="left", padx=(6, 0))
+        if not self._delivery_service_enabled:
+            ttk.Label(
+                delivery_row,
+                text="(FedEx / UPS only)",
+                foreground="#888888",
+            ).pack(side="left", padx=(8, 0))
 
         cols = ("item", "fb_qty", "fb_uom", "coverage", "send_qty", "send_uom", "lot", "note")
         headers = ("Item", "FB Qty", "FB UOM", "SF per EA", "Send Qty", "Send UOM", "Lot #", "Note")
@@ -2021,6 +2148,11 @@ class SynapseLinesDialog(tk.Toplevel):
         self.scac = scac
         self.ship_type = ship_type
         self.shipment_terms = shipment_terms
+        self.delivery_service = (
+            _delivery_service_code_from_label(self.delivery_service_var.get() or "", self._delivery_service_options)
+            if self._delivery_service_enabled
+            else ""
+        )
         self.result = out
         self.destroy()
 

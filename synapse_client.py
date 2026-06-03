@@ -161,6 +161,8 @@ class SynapseClient:
 
         # Pass through optional header fields if provided.
         for key in [
+            # delivery service (FedEx/UPS service code)
+            "delivery_service",
             # shipper
             "shipper_name",
             "shipper_contact",

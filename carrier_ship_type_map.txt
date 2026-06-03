@@ -1,5 +1,5 @@
 customer's own carrier	P
-daylight	S
+daylight	L
 estes express lines	L
 fedex	S
 fedex freight	L
