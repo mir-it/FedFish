@@ -210,13 +210,13 @@ HEADER_FIELD_LIMITS: dict[str, int] = {
     "ship_to_address_1": 40,
     "ship_to_city": 30,
     "ship_to_state": 2,
-    "ship_to_postal_code": 12,
+    "ship_to_postal_code": 5,
     "ship_to_country_code": 3,
     "bill_to_name": 40,
     "bill_to_address_1": 40,
     "bill_to_city": 30,
     "bill_to_state": 2,
-    "bill_to_postal_code": 12,
+    "bill_to_postal_code": 5,
     "bill_to_country_code": 3,
 }
 
