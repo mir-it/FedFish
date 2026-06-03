@@ -1,5 +1,4 @@
 fedex	FEDX
-ups	UPSN
 pitt ohio	PITM
-
-
+ups	UPSN
+usps	UPSN

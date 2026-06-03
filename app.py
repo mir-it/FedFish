@@ -1208,6 +1208,7 @@ class PalletDetailFrame(ttk.Frame):
         ).strip()
 
     def _soitem_note_instructions(self, rows: list[dict]) -> str:
+        notes: list[str] = []
         for row in rows:
             text = str(
                 _row_get_any(
@@ -1219,8 +1220,8 @@ class PalletDetailFrame(ttk.Frame):
                 or ""
             ).strip()
             if text:
-                return text
-        return ""
+                notes.append(text)
+        return "; ".join(notes)
 
     def _resolved_hdr_instructions(self, ship_num: str, ctx: dict, rows: list[dict] | None = None) -> str:
         manual = str(self.app.hdr_instructions_by_ship.get(ship_num, "") or "")
