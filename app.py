@@ -96,6 +96,28 @@ def _normalize_lot_number(raw_lot) -> str:
     return _LOT_DATE_PREFIX_RE.sub("", lot, count=1).strip()
 
 
+_NOTED_QTY_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:pieces|piece|pcs|pc|each|ea)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_noted_qty(text: str):
+    """Pull a quantity like '100 pieces', '100pcs', '100 each', '100 ea' from a note.
+
+    Returns an int (or float when fractional) when found, otherwise None.
+    """
+    m = _NOTED_QTY_RE.search(str(text or ""))
+    if not m:
+        return None
+    raw = m.group(1)
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    return int(val) if val.is_integer() else val
+
+
 def _scac_from_carrier_name(raw_name: str) -> str:
     name = str(raw_name or "").strip().lower()
     scac_map = {
@@ -1781,8 +1803,23 @@ class PalletDetailFrame(ttk.Frame):
                     "lot_number": _normalize_lot_number(l.get("tracking", "")),
                     "dtl_pass_thru_num_10": l.get("dtl_pass_thru_num_10"),
                     "note": note,
+                    "noted_qty": None,
                 }
             )
+
+        # Parse quantities out of the constructed header instructions field. Each
+        # note (separated by ";") is assumed to belong to the item at the same
+        # position: first note -> first item, second note -> second item, etc.
+        hdr_instructions = self._resolved_hdr_instructions(
+            str(self.app.current_ship_num or ""),
+            self.app.current_order_context or {},
+            self.app.current_items or [],
+        )
+        if hdr_instructions:
+            note_segments = [seg.strip() for seg in hdr_instructions.split(";")]
+            for i, row in enumerate(rows):
+                if i < len(note_segments):
+                    row["noted_qty"] = _parse_noted_qty(note_segments[i])
 
         dlg = SynapseLinesDialog(
             self,
@@ -1922,7 +1959,7 @@ class SynapseLinesDialog(tk.Toplevel):
     ):
         super().__init__(parent)
         self.title("Review Synapse Order Lines")
-        self.geometry("960x420")
+        self.geometry("1060x420")
         self.resizable(True, True)
         self.transient(parent.winfo_toplevel())
         self.grab_set()
@@ -1997,8 +2034,8 @@ class SynapseLinesDialog(tk.Toplevel):
                 foreground="#888888",
             ).pack(side="left", padx=(8, 0))
 
-        cols = ("item", "fb_qty", "fb_uom", "coverage", "send_qty", "send_uom", "lot", "note")
-        headers = ("Item", "FB Qty", "FB UOM", "SF per EA", "Send Qty", "Send UOM", "Lot #", "Note")
+        cols = ("item", "fb_qty", "fb_uom", "coverage", "noted_qty", "send_qty", "send_uom", "lot", "note")
+        headers = ("Item", "FB Qty", "FB UOM", "SF per EA", "Noted Qty", "Send Qty", "Send UOM", "Lot #", "Note")
         self.tree = ttk.Treeview(self, columns=cols, show="headings")
         for c, h in zip(cols, headers):
             self.tree.heading(c, text=h)
@@ -2009,6 +2046,7 @@ class SynapseLinesDialog(tk.Toplevel):
 
         for i, r in enumerate(self._rows):
             cov = r.get("coverage_sf_per_ea")
+            noted_qty = r.get("noted_qty")
             self.tree.insert(
                 "",
                 "end",
@@ -2018,6 +2056,7 @@ class SynapseLinesDialog(tk.Toplevel):
                     f"{r['fb_qty']:.3f}".rstrip("0").rstrip("."),
                     r["fb_uom"],
                     "" if cov is None else f"{cov:.3f}".rstrip("0").rstrip("."),
+                    "" if noted_qty is None else str(noted_qty),
                     "" if r.get("send_qty") is None else str(r["send_qty"]),
                     r["send_uom"],
                     r.get("lot_number", ""),
@@ -2038,8 +2077,8 @@ class SynapseLinesDialog(tk.Toplevel):
         if not row_id:
             return
         idx = int(row_id)
-        # #5 = send_qty, #7 = lot
-        if col == "#5":
+        # #6 = send_qty, #8 = lot
+        if col == "#6":
             current = self._rows[idx].get("send_qty")
 
             win = tk.Toplevel(self)
@@ -2069,7 +2108,7 @@ class SynapseLinesDialog(tk.Toplevel):
             win.bind("<Return>", lambda e: save())
             return
 
-        if col == "#7":
+        if col == "#8":
             current_lot = self._rows[idx].get("lot_number", "")
             win = tk.Toplevel(self)
             win.title("Edit Lot Number")
@@ -2092,6 +2131,7 @@ class SynapseLinesDialog(tk.Toplevel):
     def _refresh_row(self, idx: int):
         r = self._rows[idx]
         cov = r.get("coverage_sf_per_ea")
+        noted_qty = r.get("noted_qty")
         self.tree.item(
             str(idx),
             values=(
@@ -2099,6 +2139,7 @@ class SynapseLinesDialog(tk.Toplevel):
                 f"{r['fb_qty']:.3f}".rstrip("0").rstrip("."),
                 r["fb_uom"],
                 "" if cov is None else f"{cov:.3f}".rstrip("0").rstrip("."),
+                "" if noted_qty is None else str(noted_qty),
                 "" if r.get("send_qty") is None else str(r["send_qty"]),
                 r["send_uom"],
                 r.get("lot_number", ""),
@@ -2121,7 +2162,10 @@ class SynapseLinesDialog(tk.Toplevel):
             return
         out: list[dict] = []
         for r in self._rows:
-            qty = r.get("send_qty")
+            # Prefer the quantity parsed from the item's note when present;
+            # otherwise fall back to the Send Qty value.
+            noted_qty = r.get("noted_qty")
+            qty = noted_qty if noted_qty is not None else r.get("send_qty")
             if qty is None:
                 messagebox.showerror(
                     "Missing qty",
