@@ -2077,7 +2077,49 @@ class SynapseLinesDialog(tk.Toplevel):
         if not row_id:
             return
         idx = int(row_id)
-        # #6 = send_qty, #8 = lot
+        # #5 = noted_qty, #6 = send_qty, #8 = lot
+        if col == "#5":
+            current = self._rows[idx].get("noted_qty")
+
+            win = tk.Toplevel(self)
+            win.title("Edit Noted Qty")
+            win.transient(self)
+            win.grab_set()
+            ttk.Label(
+                win,
+                text=f"{self._rows[idx]['item']} noted qty (integer, blank to use Send Qty):",
+            ).pack(padx=10, pady=(10, 4))
+            var = tk.StringVar(value="" if current is None else str(current))
+            ent = ttk.Entry(win, textvariable=var, width=20)
+            ent.pack(padx=10, pady=(0, 10))
+            ent.focus_set()
+
+            def save_noted():
+                s = var.get().strip()
+                if not s:
+                    self._rows[idx]["noted_qty"] = None
+                    self._refresh_row(idx)
+                    win.destroy()
+                    return
+                try:
+                    v = int(s)
+                    if v <= 0:
+                        raise ValueError()
+                except Exception:
+                    messagebox.showerror(
+                        "Invalid qty",
+                        "Noted Qty must be a positive integer (or blank to use Send Qty).",
+                        parent=win,
+                    )
+                    return
+                self._rows[idx]["noted_qty"] = v
+                self._refresh_row(idx)
+                win.destroy()
+
+            ttk.Button(win, text="Save", command=save_noted).pack(padx=10, pady=(0, 10))
+            win.bind("<Return>", lambda e: save_noted())
+            return
+
         if col == "#6":
             current = self._rows[idx].get("send_qty")
 
