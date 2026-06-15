@@ -323,6 +323,14 @@ def _is_fedex_carrier(raw_name: str) -> bool:
     return "fedex" in str(raw_name or "").strip().lower()
 
 
+def _consignee_for_carrier(raw_name: str) -> str:
+    if _is_ups_carrier(raw_name):
+        return "MIRUPS"
+    if _is_fedex_carrier(raw_name):
+        return "MIRFEX"
+    return ""
+
+
 def _fishbowl_carrier_service_name(ctx: dict) -> str:
     ship_row = (ctx or {}).get("ship", {}) or {}
     return str(_row_get_any(ship_row, "carrier_service_name", "carrierServiceName") or "").strip()
@@ -1524,8 +1532,9 @@ class PalletDetailFrame(ttk.Frame):
             },
             "details": details,
         }
-        if _is_ups_carrier(carrier_name):
-            order_data["header"]["consignee"] = "V25337"
+        consignee = _consignee_for_carrier(carrier_name)
+        if consignee:
+            order_data["header"]["consignee"] = consignee
         delivery_service = str(delivery_service_override or "").strip()
         if not delivery_service:
             delivery_service = _delivery_service_from_fishbowl_carrier(
@@ -1715,8 +1724,9 @@ class PalletDetailFrame(ttk.Frame):
             "details": details,
         }
 
-        if _is_ups_carrier(carrier_name):
-            order_data["header"]["consignee"] = "V25337"
+        consignee = _consignee_for_carrier(carrier_name)
+        if consignee:
+            order_data["header"]["consignee"] = consignee
         # If shipment terms are 3rd party, attach bill-to info (account + address).
         if (shipment_terms or config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper() == "3RD":
             order_data["header"].update(

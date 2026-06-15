@@ -19,3 +19,5 @@ synapse_order_info_map.txt
 # OS / editor cruft
 .DS_Store
 Thumbs.db
+.env
+synapse_sent_shipments.txt
