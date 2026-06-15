@@ -151,6 +151,11 @@ def _shipment_terms_from_carrier_name(raw_name: str) -> str:
     return ""
 
 
+def _is_ups_carrier(raw_name: str) -> bool:
+    # Word-boundary match so "ups" matches UPS / "UPS Ground" but not "USPS".
+    return bool(re.search(r"\bups\b", str(raw_name or "").strip().lower()))
+
+
 SHIP_TYPE_BY_CARRIER_NAME_KEYWORDS: dict[str, tuple[str, ...]] = {
     # Edit this mapping as needed to add more carrier-name patterns.
     "S": ("ups ground",),
@@ -268,6 +273,71 @@ UPS_DELIVERY_SERVICE_OPTIONS: tuple[tuple[str, str], ...] = (
 )
 DELIVERY_SERVICE_NONE_LABEL = "(none)"
 
+# Fishbowl carrierservice.name -> Synapse delivery_service code.
+FISHBOWL_FEDEX_SERVICE_TO_DELIVERY_CODE: dict[str, str] = {
+    "2 day": "3",
+    "2 day a.m.": "10",
+    "2nd day air": "3",
+    "2nd day air am": "10",
+    "3 day select": "7",
+    "europe first international priority": "INT1",
+    "express saver": "7",
+    "fedex 2day": "3",
+    "fedex express saver": "7",
+    "fedex ground": "92",
+    "fedex home delivery": "90",
+    "fedex standard overnight": "2",
+    "first overnight": "6",
+    "ground": "92",
+    "home delivery": "90",
+    "international economy": "INT2",
+    "international first": "INT1",
+    "international priority": "INT1",
+    "next day air": "1",
+    "next day air early am": "6",
+    "next day air saver": "2",
+    "priority overnight": "1",
+    "smartpost": "92",
+    "standard overnight": "2",
+}
+FISHBOWL_UPS_SERVICE_TO_DELIVERY_CODE: dict[str, str] = {
+    "2nd day air": "2DAY",
+    "2nd day air a.m.": "2AIR",
+    "3 day select": "3DAY",
+    "ground": "GRND",
+    "mail innovations (domestic)": "GRND",
+    "next day air": "NDAY",
+    "next day air early a.m.": "NDAM",
+    "next day air saver": "NDAS",
+    "standard": "ISTD",
+    "surepost": "GRND",
+    "surepost lightweight": "GRND",
+    "worldwide expedited": "IXPD",
+    "worldwide express": "IEXP",
+    "worldwide express plus": "IXPL",
+    "worldwide saver": "ISVR",
+}
+
+
+def _is_fedex_carrier(raw_name: str) -> bool:
+    return "fedex" in str(raw_name or "").strip().lower()
+
+
+def _fishbowl_carrier_service_name(ctx: dict) -> str:
+    ship_row = (ctx or {}).get("ship", {}) or {}
+    return str(_row_get_any(ship_row, "carrier_service_name", "carrierServiceName") or "").strip()
+
+
+def _delivery_service_from_fishbowl_carrier(carrier_name: str, service_name: str = "") -> str:
+    key = " ".join(str(service_name or "").strip().lower().rstrip("?").split())
+    if not key:
+        return ""
+    if _is_fedex_carrier(carrier_name):
+        return FISHBOWL_FEDEX_SERVICE_TO_DELIVERY_CODE.get(key, "")
+    if _is_ups_carrier(carrier_name):
+        return FISHBOWL_UPS_SERVICE_TO_DELIVERY_CODE.get(key, "")
+    return ""
+
 
 def _delivery_service_options_for_carrier(raw_name: str) -> tuple[tuple[str, str], ...]:
     name = str(raw_name or "").strip().lower()
@@ -275,7 +345,7 @@ def _delivery_service_options_for_carrier(raw_name: str) -> tuple[tuple[str, str
         return ()
     if "fedex" in name:
         return FEDEX_DELIVERY_SERVICE_OPTIONS
-    if "ups" in name:
+    if _is_ups_carrier(raw_name):
         return UPS_DELIVERY_SERVICE_OPTIONS
     return ()
 
@@ -1359,6 +1429,7 @@ class PalletDetailFrame(ttk.Frame):
         carrier: str,
         ship_type_override: str = "",
         shipment_terms_override: str = "",
+        delivery_service_override: str = "",
         hdr_instructions: str = "",
     ) -> dict:
         if not rows:
@@ -1453,6 +1524,15 @@ class PalletDetailFrame(ttk.Frame):
             },
             "details": details,
         }
+        if _is_ups_carrier(carrier_name):
+            order_data["header"]["consignee"] = "V25337"
+        delivery_service = str(delivery_service_override or "").strip()
+        if not delivery_service:
+            delivery_service = _delivery_service_from_fishbowl_carrier(
+                carrier_name, _fishbowl_carrier_service_name(ctx)
+            )
+        if delivery_service:
+            order_data["header"]["delivery_service"] = delivery_service
         if (shipment_terms or config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper() == "3RD":
             order_data["header"].update(
                 {
@@ -1541,12 +1621,16 @@ class PalletDetailFrame(ttk.Frame):
             initial_shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
         if _shipment_terms_from_carrier_name(carrier_name):
             initial_shipment_terms = "3RD"
+        initial_delivery_service = _delivery_service_from_fishbowl_carrier(
+            carrier_name, _fishbowl_carrier_service_name(ctx)
+        )
 
         reviewed_payload = self._review_synapse_lines(
             review_lines,
             initial_scac=initial_scac,
             initial_ship_type=initial_ship_type,
             initial_shipment_terms=initial_shipment_terms,
+            initial_delivery_service=initial_delivery_service,
             carrier_name=carrier_name,
         )
         if reviewed_payload is None:
@@ -1631,6 +1715,8 @@ class PalletDetailFrame(ttk.Frame):
             "details": details,
         }
 
+        if _is_ups_carrier(carrier_name):
+            order_data["header"]["consignee"] = "V25337"
         # If shipment terms are 3rd party, attach bill-to info (account + address).
         if (shipment_terms or config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper() == "3RD":
             order_data["header"].update(
@@ -1747,6 +1833,7 @@ class PalletDetailFrame(ttk.Frame):
         initial_scac: str,
         initial_ship_type: str,
         initial_shipment_terms: str,
+        initial_delivery_service: str = "",
         carrier_name: str = "",
     ) -> tuple[list[dict], str, str, str, str] | None:
         coverage_map = {}
@@ -1828,6 +1915,7 @@ class PalletDetailFrame(ttk.Frame):
             initial_ship_type=initial_ship_type,
             initial_shipment_terms=initial_shipment_terms,
             delivery_service_options=_delivery_service_options_for_carrier(carrier_name),
+            initial_delivery_service=initial_delivery_service,
         )
         self.wait_window(dlg)
         if dlg.result is None:

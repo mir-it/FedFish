@@ -107,8 +107,11 @@ def items_sql_for(ship_num: str) -> str:
 
 
 SHIP_SQL_TEMPLATE = """
-SELECT *
+SELECT
+    ship.*,
+    cs.name AS carrier_service_name
 FROM ship
+LEFT JOIN carrierservice cs ON cs.id = ship.carrierServiceId
 WHERE soId = (
     SELECT id
     FROM so

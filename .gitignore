@@ -9,7 +9,7 @@ venv/
 env/
 
 # Local secrets / config (each machine has its own)
-
+.env
 
 # Per-machine runtime state written by the app (must NOT be shared via git)
 synapse_sent_shipments.txt
