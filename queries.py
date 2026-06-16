@@ -20,9 +20,11 @@ SELECT
         ORDER BY sc.id
         LIMIT 1
     ) AS carrier_name,
+    COALESCE(customer.name, '') AS customer_name,
     lg.name AS location_group
 FROM so
 JOIN locationgroup lg ON so.locationGroupId = lg.id
+LEFT JOIN customer ON customer.id = so.customerId
 LEFT JOIN ship ON ship.id = (
     SELECT s.id
     FROM ship s

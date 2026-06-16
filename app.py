@@ -323,8 +323,10 @@ def _is_fedex_carrier(raw_name: str) -> bool:
     return "fedex" in str(raw_name or "").strip().lower()
 
 
-def _consignee_for_carrier(raw_name: str) -> str:
+def _consignee_for_carrier(raw_name: str, customer_name: str = "") -> str:
     if _is_ups_carrier(raw_name):
+        if str(customer_name or "").strip() == "Ecom HD":
+            return "HDMIR"
         return "MIRUPS"
     if _is_fedex_carrier(raw_name):
         return "MIRFEX"
@@ -830,13 +832,14 @@ class ShipmentsFrame(ttk.Frame):
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
-        cols = ("ship_num", "salesperson", "city", "state", "zip", "carrier", "synapse_status")
-        headers = ("Ship #", "Salesperson", "City", "State", "Zip", "Carrier", "Synapse")
+        cols = ("ship_num", "customer", "salesperson", "city", "state", "zip", "carrier", "synapse_status")
+        headers = ("Ship #", "Customer", "Salesperson", "City", "State", "Zip", "Carrier", "Synapse")
         self._status_col_idx = len(cols) - 1
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
         for c, h in zip(cols, headers):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=130, anchor="w")
+        self.tree.column("customer", width=200, anchor="w")
         self.tree.column("salesperson", width=180, anchor="w")
         self.tree.column("synapse_status", width=90, anchor="center")
         self.tree.tag_configure("synapse_sent", background="#dff0d8")
@@ -896,6 +899,7 @@ class ShipmentsFrame(ttk.Frame):
                 collected_rows.append(
                     {
                         "ship_num": str(num),
+                        "customer": self._extract_customer(first),
                         "salesperson": self._extract_salesperson(first),
                         "city": str(first.get("city", "") or ""),
                         "state": str(first.get("state", "") or ""),
@@ -914,6 +918,9 @@ class ShipmentsFrame(ttk.Frame):
             self.app.set_status(f"Loaded {len(grouped)} shipments (showing {shown}).")
 
         self.app.run_async(do, ok)
+
+    def _extract_customer(self, row: dict) -> str:
+        return str(_row_get_any(row, "customer_name", "customerName") or "").strip()
 
     def _extract_salesperson(self, row: dict) -> str:
         value = _row_get_any(
@@ -973,6 +980,7 @@ class ShipmentsFrame(ttk.Frame):
                 iid=ship_num,
                 values=(
                     ship_num,
+                    row.get("customer", ""),
                     salesperson,
                     row.get("city", ""),
                     row.get("state", ""),
@@ -1532,7 +1540,9 @@ class PalletDetailFrame(ttk.Frame):
             },
             "details": details,
         }
-        consignee = _consignee_for_carrier(carrier_name)
+        consignee = _consignee_for_carrier(
+            carrier_name, str(_row_get_any(customer_row, "name") or "").strip()
+        )
         if consignee:
             order_data["header"]["consignee"] = consignee
         delivery_service = str(delivery_service_override or "").strip()
@@ -1724,7 +1734,9 @@ class PalletDetailFrame(ttk.Frame):
             "details": details,
         }
 
-        consignee = _consignee_for_carrier(carrier_name)
+        consignee = _consignee_for_carrier(
+            carrier_name, str(_row_get_any(customer_row, "name") or "").strip()
+        )
         if consignee:
             order_data["header"]["consignee"] = consignee
         # If shipment terms are 3rd party, attach bill-to info (account + address).
