@@ -14,10 +14,9 @@ env/
 # Per-machine runtime state written by the app (must NOT be shared via git)
 synapse_sent_shipments.txt
 synapse_order_info_map.txt
+synapse_last_send_map.txt
 
 
 # OS / editor cruft
 .DS_Store
 Thumbs.db
-.env
-synapse_sent_shipments.txt
