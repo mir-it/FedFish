@@ -73,13 +73,10 @@ SELECT
     COALESCE(
         (
             SELECT ttv.info
-            FROM shipitem si
-            LEFT JOIN tagtrackingview ttv ON ttv.tagId = si.tagId
-            WHERE si.shipId = ship.id
-              AND si.soItemId = soitem.id
+            FROM tagtrackingview ttv
+            WHERE ttv.tagId = shipitem.tagId
               AND ttv.info IS NOT NULL
               AND ttv.info <> ''
-            ORDER BY si.id
             LIMIT 1
         ),
         ''
@@ -87,13 +84,14 @@ SELECT
     soitem.id AS order_index,
     COALESCE(soitem.note, '') AS soitem_note,
     soitem.dateScheduledFulfillment AS date_scheduled_fulfillment,
-    soitem.qtyOrdered AS qty,
+    shipitem.qtyShipped AS qty,
     uom.code AS uom
 FROM ship
 JOIN so ON ship.soId = so.id
 JOIN locationgroup lg ON so.locationGroupId = lg.id
 JOIN stateconst ON ship.shipToStateId = stateconst.id
-JOIN soitem ON so.id = soitem.soId
+JOIN shipitem ON shipitem.shipId = ship.id
+JOIN soitem ON soitem.id = shipitem.soItemId
 JOIN product ON soitem.productId = product.id
 JOIN uom ON soitem.uomId = uom.id
 WHERE ship.statusId = {PACKED_STATUS_ID}

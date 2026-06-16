@@ -163,6 +163,7 @@ class SynapseClient:
         for key in [
             # delivery service (FedEx/UPS service code)
             "delivery_service",
+            "ship_to_address_2",
             # shipper
             "shipper_name",
             "shipper_contact",

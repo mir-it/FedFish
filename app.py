@@ -324,11 +324,14 @@ def _is_fedex_carrier(raw_name: str) -> bool:
 
 
 def _consignee_for_carrier(raw_name: str, customer_name: str = "") -> str:
+    customer = str(customer_name or "").strip()
     if _is_ups_carrier(raw_name):
-        if str(customer_name or "").strip() == "Ecom HD":
+        if customer == "Ecom HD":
             return "HDMIR"
         return "MIRUPS"
     if _is_fedex_carrier(raw_name):
+        if customer == "Ecom LS":
+            return "LOWMIR"
         return "MIRFEX"
     return ""
 
@@ -393,6 +396,7 @@ HEADER_FIELD_LIMITS: dict[str, int] = {
     "shipment_terms": 3,
     "ship_to_name": 40,
     "ship_to_address_1": 40,
+    "ship_to_address_2": 40,
     "ship_to_city": 30,
     "ship_to_state": 2,
     "ship_to_postal_code": 5,
@@ -420,6 +424,15 @@ HEADER_UPPERCASE_FIELDS: set[str] = {
 }
 
 HEADER_DATE_FIELDS: set[str] = set()
+
+
+def _split_ship_to_address(raw: str) -> tuple[str, str]:
+    text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if "\n" not in text:
+        return text, ""
+    first_line, rest = text.split("\n", 1)
+    other_lines = [part.strip() for part in rest.split("\n") if part.strip()]
+    return " ".join(other_lines), first_line.strip()
 
 
 def _format_header_date_yyyymmdd(value) -> str:
@@ -450,6 +463,7 @@ def _apply_header_field_limits(header: dict) -> dict:
 
 SENT_SHIPMENTS_FILE = Path(__file__).with_name("synapse_sent_shipments.txt")
 SYNAPSE_ORDER_INFO_FILE = Path(__file__).with_name("synapse_order_info_map.txt")
+SYNAPSE_LAST_SEND_FILE = Path(__file__).with_name("synapse_last_send_map.txt")
 CARRIER_SCAC_MAP_FILE = Path(__file__).with_name("carrier_scac_map.txt")
 CARRIER_SHIP_TYPE_MAP_FILE = Path(__file__).with_name("carrier_ship_type_map.txt")
 
@@ -498,6 +512,7 @@ class App(tk.Tk):
         self.carrier_scac_map: dict[str, str] = self._load_carrier_scac_map()
         self.carrier_ship_type_map: dict[str, str] = self._load_carrier_ship_type_map()
         self.synapse_order_info_by_ship: dict[str, dict] = self._load_synapse_order_info_map()
+        self.synapse_last_send_by_ship: dict[str, dict] = self._load_synapse_last_send_map()
 
         self.container = ttk.Frame(self)
         self.container.pack(fill="both", expand=True)
@@ -736,6 +751,67 @@ class App(tk.Tk):
         self.synapse_order_info_by_ship[ship_key] = fields
         self.save_synapse_order_info_map()
 
+    def _load_synapse_last_send_map(self) -> dict[str, dict]:
+        if not SYNAPSE_LAST_SEND_FILE.exists():
+            return {}
+        try:
+            lines = SYNAPSE_LAST_SEND_FILE.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return {}
+        out: dict[str, dict] = {}
+        for line in lines:
+            text = line.strip()
+            if not text or "\t" not in text:
+                continue
+            ship_num, raw_json = text.split("\t", 1)
+            ship_key = ship_num.strip()
+            if not ship_key:
+                continue
+            try:
+                record = json.loads(raw_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(record, dict) and isinstance(record.get("payload"), dict):
+                out[ship_key] = record
+        return out
+
+    def save_synapse_last_send_map(self):
+        lines = []
+        for ship_num in sorted(self.synapse_last_send_by_ship):
+            record = self.synapse_last_send_by_ship.get(ship_num) or {}
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            lines.append(f"{ship_num}\t{json.dumps(record, separators=(',', ':'))}")
+        payload_text = "\n".join(lines)
+        if payload_text:
+            payload_text += "\n"
+        try:
+            SYNAPSE_LAST_SEND_FILE.write_text(payload_text, encoding="utf-8")
+        except Exception as e:
+            self.set_status(f"Warning: failed saving Synapse last-send map ({e}).")
+
+    def get_synapse_last_send(self, ship_num: str) -> dict | None:
+        ship_key = str(ship_num or "").strip()
+        if not ship_key:
+            return None
+        record = self.synapse_last_send_by_ship.get(ship_key)
+        if record:
+            return dict(record)
+        return None
+
+    def remember_synapse_last_send(self, ship_num: str, payload: dict | None, response: dict | None):
+        ship_key = str(ship_num or "").strip()
+        if not ship_key or not isinstance(payload, dict):
+            return
+        record = {"payload": payload}
+        if response is not None:
+            record["response"] = response
+        if self.synapse_last_send_by_ship.get(ship_key) == record:
+            return
+        self.synapse_last_send_by_ship[ship_key] = record
+        self.save_synapse_last_send_map()
+
 
 class LoginFrame(ttk.Frame):
     def __init__(self, parent, app: App):
@@ -828,14 +904,13 @@ class ShipmentsFrame(ttk.Frame):
         self.ship_search_entry = ttk.Entry(top, textvariable=self.ship_search_var, width=18)
         self.ship_search_entry.pack(side="left")
         self.ship_search_var.trace_add("write", lambda *_: self._render_shipments())
-        ttk.Button(top, text="Send Selected", command=self._send_selected_synapse).pack(side="right", padx=(0, 8))
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
         cols = ("ship_num", "customer", "salesperson", "city", "state", "zip", "carrier", "synapse_status")
         headers = ("Ship #", "Customer", "Salesperson", "City", "State", "Zip", "Carrier", "Synapse")
         self._status_col_idx = len(cols) - 1
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
         for c, h in zip(cols, headers):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=130, anchor="w")
@@ -1017,84 +1092,6 @@ class ShipmentsFrame(ttk.Frame):
         current_values[self._status_col_idx] = "FAILED"
         self.tree.item(ship_num, values=tuple(current_values), tags=("synapse_failed",))
 
-    def _send_selected_synapse(self):
-        selected = list(self.tree.selection())
-        if not selected:
-            messagebox.showinfo("Select shipments", "Select one or more shipment rows first.")
-            return
-        self._send_shipments_to_synapse(selected, mode_label="selected")
-
-    def _send_shipments_to_synapse(self, ship_nums: list[str], mode_label: str):
-        if not config.SYNAPSE_USERNAME or not config.SYNAPSE_PASSWORD:
-            messagebox.showerror(
-                "Synapse not configured",
-                "Set SYNAPSE_USERNAME and SYNAPSE_PASSWORD in your .env (and restart the app).",
-            )
-            return
-
-        detail_frame = self.app.frames.get("detail")
-        if not isinstance(detail_frame, PalletDetailFrame):
-            messagebox.showerror("Internal error", "Detail frame unavailable.")
-            return
-
-        self.app.set_status(f"Sending {len(ship_nums)} {mode_label} shipment(s) to Synapse...")
-
-        def do():
-            client = SynapseClient(
-                SynapseConfig(
-                    base_url=config.SYNAPSE_BASE_URL,
-                    username=config.SYNAPSE_USERNAME,
-                    password=config.SYNAPSE_PASSWORD,
-                )
-            )
-            client.login()
-            results: list[dict] = []
-            for ship_num in ship_nums:
-                try:
-                    rows = self.app.fb.data_query(queries.items_sql_for(ship_num))
-                    ctx = detail_frame._load_order_context(ship_num)
-                    review_lines = detail_frame._build_review_lines(rows)
-                    reviewed = detail_frame._auto_review_synapse_lines(review_lines)
-                    carrier_name = next((str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()), "")
-                    scac = self.app.resolve_scac_for_carrier(carrier_name)
-                    ship_type = self.app.resolve_ship_type_for_carrier(carrier_name)
-                    order_data = detail_frame._build_order_data(
-                        rows,
-                        ctx,
-                        reviewed,
-                        scac,
-                        ship_type_override=ship_type,
-                        hdr_instructions=detail_frame._resolved_hdr_instructions(ship_num, ctx, rows),
-                    )
-                    response = client.create_order(order_data)
-                    self.app.remember_synapse_order_info(ship_num, response)
-                    results.append({"ship_num": ship_num, "ok": True, "carrier_name": carrier_name, "scac": scac, "ship_type": ship_type})
-                except Exception as e:
-                    results.append({"ship_num": ship_num, "ok": False, "error": str(e)})
-            return results
-
-        def ok(results):
-            sent = 0
-            failed = 0
-            for r in results:
-                num = str(r.get("ship_num") or "")
-                if r.get("ok"):
-                    sent += 1
-                    self.mark_synapse_sent(num)
-                    self.app.remember_scac_for_carrier(str(r.get("carrier_name") or ""), str(r.get("scac") or ""))
-                    self.app.remember_ship_type_for_carrier(str(r.get("carrier_name") or ""), str(r.get("ship_type") or ""))
-                else:
-                    failed += 1
-                    self.mark_synapse_failed(num, str(r.get("error") or "Unknown error"))
-            self.app.set_status(f"Send {mode_label} complete: {sent} sent, {failed} failed.")
-            messagebox.showinfo(f"Send {mode_label.title()} complete", f"Sent: {sent}\nFailed: {failed}")
-
-        def err(e):
-            messagebox.showerror(f"Send {mode_label.title()} error", str(e))
-            self.app.set_status(f"Send {mode_label} failed.")
-
-        self.app.run_async(do, ok, err)
-
     def _view_selected(self):
         sel = self.tree.selection()
         if not sel:
@@ -1120,6 +1117,9 @@ class PalletDetailFrame(ttk.Frame):
     def __init__(self, parent, app: App):
         super().__init__(parent)
         self.app = app
+        self._items_load_seq = 0
+        self._review_rows: list[dict] = []
+        self._delivery_service_options: tuple[tuple[str, str], ...] = ()
 
         header = ttk.Frame(self, padding=10)
         header.pack(fill="x")
@@ -1130,27 +1130,71 @@ class PalletDetailFrame(ttk.Frame):
         mid = ttk.Frame(self, padding=(10, 0))
         mid.pack(fill="both", expand=True)
 
-        pallet_frame = ttk.LabelFrame(mid, text="Pallets", padding=5)
-        pallet_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        pcols = ("n", "weight", "len", "width", "height")
-        pheaders = ("#", "Weight", "Len", "Width", "Height")
-        self.pallet_tree = ttk.Treeview(pallet_frame, columns=pcols, show="headings", height=10)
-        for c, h in zip(pcols, pheaders):
-            self.pallet_tree.heading(c, text=h)
-            self.pallet_tree.column(c, width=80, anchor="w")
-        self.pallet_tree.pack(fill="both", expand=True)
+        order_frame = ttk.LabelFrame(mid, text="Order", padding=5)
+        order_frame.pack(fill="x", pady=(0, 8))
+
+        scac_row = ttk.Frame(order_frame)
+        scac_row.pack(fill="x")
+        ttk.Label(scac_row, text="SCAC:").pack(side="left")
+        self.scac_var = tk.StringVar(value="")
+        ttk.Entry(scac_row, textvariable=self.scac_var, width=16).pack(side="left", padx=(6, 0))
+        ttk.Label(scac_row, text="Carrier:").pack(side="left", padx=(18, 6))
+        self.carrier_name_var = tk.StringVar(value="")
+        ttk.Label(scac_row, textvariable=self.carrier_name_var, width=24).pack(side="left")
+        ttk.Label(scac_row, text="Ship Type:").pack(side="left", padx=(18, 6))
+        self.ship_type_var = tk.StringVar(value=_ship_type_label_from_code(config.SYNAPSE_SHIP_TYPE))
+        ttk.Combobox(
+            scac_row,
+            textvariable=self.ship_type_var,
+            width=24,
+            values=tuple(f"{code} - {desc}" for code, desc in SHIP_TYPE_OPTIONS),
+            state="readonly",
+        ).pack(side="left")
+        ttk.Label(scac_row, text="Shipment Terms:").pack(side="left", padx=(18, 6))
+        self.shipment_terms_var = tk.StringVar(
+            value=_shipment_terms_label_from_code("3RD")
+        )
+        ttk.Combobox(
+            scac_row,
+            textvariable=self.shipment_terms_var,
+            width=28,
+            values=tuple(f"{code} - {desc}" for code, desc in SHIPMENT_TERMS_OPTIONS),
+            state="readonly",
+        ).pack(side="left")
+
+        delivery_row = ttk.Frame(order_frame)
+        delivery_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(delivery_row, text="Delivery Service:").pack(side="left")
+        self.delivery_service_var = tk.StringVar(value=DELIVERY_SERVICE_NONE_LABEL)
+        self.delivery_service_combo = ttk.Combobox(
+            delivery_row,
+            textvariable=self.delivery_service_var,
+            width=40,
+            values=(DELIVERY_SERVICE_NONE_LABEL,),
+            state="disabled",
+        )
+        self.delivery_service_combo.pack(side="left", padx=(6, 0))
+        self.delivery_service_hint = ttk.Label(
+            delivery_row,
+            text="(FedEx / UPS only)",
+            foreground="#888888",
+        )
+        self.delivery_service_hint.pack(side="left", padx=(8, 0))
 
         item_frame = ttk.LabelFrame(mid, text="Items", padding=5)
-        item_frame.pack(side="left", fill="both", expand=True, padx=(5, 0))
-        icols = ("item", "qty", "uom", "tracking", "carrier", "po")
-        iheaders = ("Item #", "Qty", "UOM", "Tracking", "Carrier", "PO")
-        self.item_tree = ttk.Treeview(item_frame, columns=icols, show="headings", height=10)
+        item_frame.pack(fill="both", expand=True)
+        icols = ("item", "coverage", "noted_qty", "send_qty", "lot", "note")
+        iheaders = ("Item", "SF per EA", "Send Qty", "Fallback Qty", "Lot #", "Note")
+        self.item_tree = ttk.Treeview(item_frame, columns=icols, show="headings", height=12)
         for c, h in zip(icols, iheaders):
             self.item_tree.heading(c, text=h)
             self.item_tree.column(c, width=100, anchor="w")
-        self.item_tree.column("tracking", width=160, anchor="w")
-        self.item_tree.column("carrier", width=130, anchor="w")
+        self.item_tree.column("item", width=180, anchor="w")
+        self.item_tree.column("noted_qty", width=90, anchor="w")
+        self.item_tree.column("send_qty", width=100, anchor="w")
+        self.item_tree.column("note", width=170, anchor="w")
         self.item_tree.pack(fill="both", expand=True)
+        self.item_tree.bind("<Double-1>", self._on_review_item_double_click)
 
         actions = ttk.Frame(self, padding=10)
         actions.pack(fill="x")
@@ -1165,7 +1209,7 @@ class PalletDetailFrame(ttk.Frame):
         self.order_info_btn.pack(side="left", padx=(8, 0))
         self.toggle_raw_btn = ttk.Button(
             actions,
-            text="Show Synapse response",
+            text="Show last payload",
             command=self._toggle_raw,
             state="disabled",
         )
@@ -1202,60 +1246,42 @@ class PalletDetailFrame(ttk.Frame):
         )
         self._set_instructions_text(self.app.hdr_instructions_by_ship.get(num, ""))
 
-        self.pallet_tree.delete(*self.pallet_tree.get_children())
-        for i, p in enumerate(pallets, start=1):
-            self.pallet_tree.insert(
-                "", "end",
-                values=(
-                    i,
-                    p.get("weight", ""),
-                    p.get("length", ""),
-                    p.get("width", ""),
-                    p.get("height", ""),
-                ),
-            )
-
         self.item_tree.delete(*self.item_tree.get_children())
-        self.toggle_raw_btn.config(state="disabled")
+        self._review_rows = []
+        self.carrier_name_var.set("")
         self._hide_raw()
-        self._last_synapse_response = None
-        self._last_synapse_payload = None
         self._last_order_info_payload = None
         self._last_order_info_response = None
+        self._restore_last_synapse_send_for_ship(num)
         self._update_order_info_btn_state()
         self._update_raw_btn_state()
+        self.app.current_items = []
         self.app.current_order_context = {}
+        load_seq = self._items_load_seq + 1
+        self._items_load_seq = load_seq
 
         self.app.set_status(f"Loading items for {num}...")
 
         def do():
-            rows = self.app.fb.data_query(queries.items_sql_for(num))
-            ctx = self._load_order_context(num)
-            return rows, ctx
+            rows, ctx = self._load_shipment_items_and_context(num)
+            return load_seq, num, rows, ctx
 
         def ok(payload):
-            rows, ctx = payload
+            load_seq, ship_num, rows, ctx = payload
+            if load_seq != self._items_load_seq or ship_num != self.app.current_ship_num:
+                return
             self.app.current_items = rows
             self.app.current_order_context = ctx
-            self._set_instructions_text(self._resolved_hdr_instructions(num, ctx, rows))
-            for r in rows:
-                item_num = str(r.get("item_num", "") or "")
-                if self._should_exclude_item(item_num):
-                    continue
-                self.item_tree.insert(
-                    "", "end",
-                    values=(
-                        r.get("item_num", ""),
-                        r.get("qty", ""),
-                        r.get("uom", ""),
-                        _normalize_lot_number(r.get("tracking", "")),
-                        r.get("carrier_name", ""),
-                        r.get("po_number", ""),
-                    ),
-                )
-            self.app.set_status(f"Shipment {num}: {len(pallets)} pallets, {len(rows)} items.")
+            self._set_instructions_text(self._resolved_hdr_instructions(ship_num, ctx, rows))
+            self._setup_review_ui(ship_num, rows, ctx)
+            self.app.set_status(f"Shipment {ship_num}: {len(pallets)} pallets, {len(rows)} items.")
 
         self.app.run_async(do, ok)
+
+    def _load_shipment_items_and_context(self, ship_num: str) -> tuple[list[dict], dict]:
+        rows = self.app.fb.data_query(queries.items_sql_for(ship_num))
+        ctx = self._load_order_context(ship_num)
+        return rows, ctx
 
     def _query_first(self, sql: str) -> dict:
         try:
@@ -1394,49 +1420,6 @@ class PalletDetailFrame(ttk.Frame):
                 )
         return review_lines
 
-    def _auto_review_synapse_lines(self, lines: list[dict]) -> list[dict]:
-        coverage_map = {}
-        if config.PRODUCT_COVERAGE_CSV:
-            try:
-                coverage_map = load_coverage_map_from_csv(config.PRODUCT_COVERAGE_CSV)
-            except Exception:
-                coverage_map = {}
-
-        out: list[dict] = []
-        for l in lines:
-            item = l["item"]
-            item_key = item.upper()
-            fb_uom = normalize_uom(l.get("fb_uom", ""))
-            fb_qty = float(l.get("fb_qty") or 0)
-            cov = coverage_map.get(item_key).coverage_sf_per_ea if item_key in coverage_map else None
-
-            send_uom = "EA"
-            send_qty = None
-            if fb_uom == "SF" and cov:
-                send_qty, _ = suggest_each_qty(fb_qty, cov)
-            elif fb_uom in {"EA", "PCS"}:
-                send_uom = "EA"
-                send_qty = int(fb_qty) if float(fb_qty).is_integer() else None
-            elif fb_uom == "BOX":
-                send_uom = "BOX"
-                send_qty = int(fb_qty) if float(fb_qty).is_integer() else None
-
-            if send_qty is None:
-                raise ValueError(f"Missing Send Qty for item {item}.")
-            lot_number = _normalize_lot_number(l.get("tracking"))
-            if config.SYNAPSE_REQUIRE_LOT and not lot_number:
-                raise ValueError(f"Lot number is required for item {item}.")
-            out.append(
-                {
-                    "item": item,
-                    "send_uom": send_uom,
-                    "send_qty": int(send_qty),
-                    "lot_number": lot_number,
-                    "dtl_pass_thru_num_10": l.get("dtl_pass_thru_num_10"),
-                }
-            )
-        return out
-
     def _build_order_data(
         self,
         rows: list[dict],
@@ -1463,7 +1446,9 @@ class PalletDetailFrame(ttk.Frame):
 
         ship_to_name = str(_row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or "").strip() or "SHIP TO"
         ship_to_name = ship_to_name[:40]
-        ship_to_address_1 = str(_row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or "").strip()
+        ship_to_address_1, ship_to_address_2 = _split_ship_to_address(
+            _row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or ""
+        )
         ship_to_city = str(_row_get_any(ship_row, "shipToCity") or first.get("city") or "").strip()
         ship_to_state = self._ship_to_state_code(ship_row, str(first.get("state") or ""))
         ship_to_postal_code = str(_row_get_any(ship_row, "shipToZip", "shipToPostalCode") or first.get("zip") or "").strip()
@@ -1540,6 +1525,8 @@ class PalletDetailFrame(ttk.Frame):
             },
             "details": details,
         }
+        if ship_to_address_2:
+            order_data["header"]["ship_to_address_2"] = ship_to_address_2
         consignee = _consignee_for_carrier(
             carrier_name, str(_row_get_any(customer_row, "name") or "").strip()
         )
@@ -1584,16 +1571,17 @@ class PalletDetailFrame(ttk.Frame):
             )
             return
 
+        ship_num = str(self.app.current_ship_num or "").strip()
+        if not ship_num:
+            messagebox.showwarning("No shipment", "No shipment is selected.")
+            return
         if not self.app.current_items:
             messagebox.showwarning("No items", "No items are loaded for this shipment yet.")
             return
 
-        first = self.app.current_items[0]
-        ship_num = self.app.current_ship_num
+        rows = self.app.current_items
         ctx = self.app.current_order_context or {}
-        if ship_num and not ctx:
-            ctx = self._load_order_context(ship_num)
-            self.app.current_order_context = ctx
+        first = rows[0]
         ship_row = ctx.get("ship", {}) or {}
         so_row = ctx.get("so", {}) or {}
         customer_row = ctx.get("customer", {}) or {}
@@ -1609,9 +1597,9 @@ class PalletDetailFrame(ttk.Frame):
             _row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or ""
         ).strip() or "SHIP TO"
         ship_to_name = ship_to_name[:40]
-        ship_to_address_1 = str(
+        ship_to_address_1, ship_to_address_2 = _split_ship_to_address(
             _row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or ""
-        ).strip()
+        )
         ship_to_city = str(_row_get_any(ship_row, "shipToCity") or first.get("city") or "").strip()
         ship_to_state = self._ship_to_state_code(ship_row, str(first.get("state") or ""))
         ship_to_postal_code = str(
@@ -1624,38 +1612,17 @@ class PalletDetailFrame(ttk.Frame):
             )
             return
 
-        review_lines = self._build_review_lines(self.app.current_items)
-
         carrier_name = next(
-            (str(r.get("carrier_name") or "").strip() for r in self.app.current_items if str(r.get("carrier_name") or "").strip()),
+            (str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()),
             "",
         )
-        initial_scac = self.app.resolve_scac_for_carrier(carrier_name)
-        initial_ship_type = self.app.resolve_ship_type_for_carrier(carrier_name)
-        initial_shipment_terms = _normalize_terms(
-            str(_row_get_any(so_row, "shipmentTerms", "shipTerms", "freightTerms", "termCode") or "")
-        )
-        if not initial_shipment_terms:
-            third_party_flag = _to_boolish(_row_get_any(so_row, "isThirdParty", "thirdPartyBilling", "thirdParty"))
-            initial_shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
-        if _shipment_terms_from_carrier_name(carrier_name):
-            initial_shipment_terms = "3RD"
-        initial_delivery_service = _delivery_service_from_fishbowl_carrier(
-            carrier_name, _fishbowl_carrier_service_name(ctx)
-        )
-
-        reviewed_payload = self._review_synapse_lines(
-            review_lines,
-            initial_scac=initial_scac,
-            initial_ship_type=initial_ship_type,
-            initial_shipment_terms=initial_shipment_terms,
-            initial_delivery_service=initial_delivery_service,
-            carrier_name=carrier_name,
-        )
-        if reviewed_payload is None:
-            self.app.set_status("Synapse order cancelled.")
+        header_fields = self._read_order_header_fields()
+        if header_fields is None:
             return
-        reviewed, carrier, ship_type, shipment_terms, delivery_service = reviewed_payload
+        carrier, ship_type, shipment_terms, delivery_service = header_fields
+        reviewed = self._collect_reviewed_lines_for_send()
+        if reviewed is None:
+            return
 
         details = [
             {
@@ -1671,7 +1638,7 @@ class PalletDetailFrame(ttk.Frame):
             messagebox.showerror("No order lines", "Could not build any detail lines from Fishbowl items.")
             return
 
-        ship_date = self._ship_date_from_soitem_rows(self.app.current_items)
+        ship_date = self._ship_date_from_soitem_rows(rows)
         if not ship_date:
             messagebox.showerror(
                 "Missing Ship Date",
@@ -1734,6 +1701,8 @@ class PalletDetailFrame(ttk.Frame):
             "details": details,
         }
 
+        if ship_to_address_2:
+            order_data["header"]["ship_to_address_2"] = ship_to_address_2
         consignee = _consignee_for_carrier(
             carrier_name, str(_row_get_any(customer_row, "name") or "").strip()
         )
@@ -1766,6 +1735,7 @@ class PalletDetailFrame(ttk.Frame):
             }
 
         self._last_synapse_payload = order_data
+        self.app.remember_synapse_last_send(ship_num, order_data, None)
         self.synapse_btn.config(state="disabled")
         self.app.set_status("Creating Synapse order...")
 
@@ -1788,6 +1758,12 @@ class PalletDetailFrame(ttk.Frame):
             self.synapse_btn.config(state="normal")
             self._last_synapse_response = result.get("response")
             self._last_synapse_payload = result.get("sent_payload")
+            if self.app.current_ship_num:
+                self.app.remember_synapse_last_send(
+                    self.app.current_ship_num,
+                    self._last_synapse_payload,
+                    self._last_synapse_response,
+                )
             self.app.remember_scac_for_carrier(carrier_name, carrier)
             self.app.remember_ship_type_for_carrier(carrier_name, ship_type)
             if self.app.current_ship_num:
@@ -1805,6 +1781,12 @@ class PalletDetailFrame(ttk.Frame):
             self._last_synapse_response = {"error": str(e)}
             if isinstance(e, SynapseCreateOrderError) and e.sent_payload is not None:
                 self._last_synapse_payload = e.sent_payload
+            if self.app.current_ship_num:
+                self.app.remember_synapse_last_send(
+                    self.app.current_ship_num,
+                    self._last_synapse_payload,
+                    self._last_synapse_response,
+                )
             self._update_raw_btn_state()
             if self.app.current_ship_num:
                 shipments_frame = self.app.frames.get("shipments")
@@ -1849,15 +1831,57 @@ class PalletDetailFrame(ttk.Frame):
         keywords = [k.strip().lower() for k in (config.EXCLUDE_ITEM_KEYWORDS or "").split(",") if k.strip()]
         return any(k in s for k in keywords)
 
-    def _review_synapse_lines(
-        self,
-        lines: list[dict],
-        initial_scac: str,
-        initial_ship_type: str,
-        initial_shipment_terms: str,
-        initial_delivery_service: str = "",
-        carrier_name: str = "",
-    ) -> tuple[list[dict], str, str, str, str] | None:
+    def _setup_review_ui(self, ship_num: str, rows: list[dict], ctx: dict):
+        so_row = ctx.get("so", {}) or {}
+        carrier_name = next(
+            (str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()),
+            "",
+        )
+        self.carrier_name_var.set(carrier_name)
+        self.scac_var.set(self.app.resolve_scac_for_carrier(carrier_name))
+
+        ship_type = self.app.resolve_ship_type_for_carrier(carrier_name)
+        if ship_type not in VALID_SHIP_TYPES:
+            ship_type = config.SYNAPSE_SHIP_TYPE
+        self.ship_type_var.set(_ship_type_label_from_code(ship_type))
+
+        shipment_terms = _normalize_terms(
+            str(_row_get_any(so_row, "shipmentTerms", "shipTerms", "freightTerms", "termCode") or "")
+        )
+        if not shipment_terms:
+            shipment_terms = "3RD"
+        if _shipment_terms_from_carrier_name(carrier_name):
+            shipment_terms = "3RD"
+        self.shipment_terms_var.set(_shipment_terms_label_from_code(shipment_terms))
+
+        self._delivery_service_options = _delivery_service_options_for_carrier(carrier_name)
+        delivery_enabled = bool(self._delivery_service_options)
+        delivery_values = (
+            DELIVERY_SERVICE_NONE_LABEL,
+            *(f"{code} - {desc}" for code, desc in self._delivery_service_options),
+        )
+        self.delivery_service_combo.config(
+            values=delivery_values,
+            state="readonly" if delivery_enabled else "disabled",
+        )
+        initial_delivery_service = _delivery_service_from_fishbowl_carrier(
+            carrier_name, _fishbowl_carrier_service_name(ctx)
+        )
+        self.delivery_service_var.set(
+            _delivery_service_label_from_code(initial_delivery_service, self._delivery_service_options)
+            if delivery_enabled
+            else DELIVERY_SERVICE_NONE_LABEL
+        )
+        self.delivery_service_hint.pack_forget()
+        if not delivery_enabled:
+            self.delivery_service_hint.pack(side="left", padx=(8, 0))
+
+        review_lines = self._build_review_lines(rows)
+        hdr_instructions = self._resolved_hdr_instructions(ship_num, ctx, rows)
+        self._review_rows = self._build_synapse_review_rows(review_lines, hdr_instructions)
+        self._populate_review_item_tree()
+
+    def _build_synapse_review_rows(self, lines: list[dict], hdr_instructions: str = "") -> list[dict]:
         coverage_map = {}
         if config.PRODUCT_COVERAGE_CSV:
             try:
@@ -1916,33 +1940,209 @@ class PalletDetailFrame(ttk.Frame):
                 }
             )
 
-        # Parse quantities out of the constructed header instructions field. Each
-        # note (separated by ";") is assumed to belong to the item at the same
-        # position: first note -> first item, second note -> second item, etc.
-        hdr_instructions = self._resolved_hdr_instructions(
-            str(self.app.current_ship_num or ""),
-            self.app.current_order_context or {},
-            self.app.current_items or [],
-        )
         if hdr_instructions:
             note_segments = [seg.strip() for seg in hdr_instructions.split(";")]
             for i, row in enumerate(rows):
                 if i < len(note_segments):
                     row["noted_qty"] = _parse_noted_qty(note_segments[i])
+        return rows
 
-        dlg = SynapseLinesDialog(
-            self,
-            rows,
-            initial_scac=initial_scac,
-            initial_ship_type=initial_ship_type,
-            initial_shipment_terms=initial_shipment_terms,
-            delivery_service_options=_delivery_service_options_for_carrier(carrier_name),
-            initial_delivery_service=initial_delivery_service,
+    def _review_tree_column_name(self, col_id: str) -> str:
+        if not col_id or col_id == "#0":
+            return ""
+        idx = int(col_id[1:]) - 1
+        cols = self.item_tree["columns"]
+        if 0 <= idx < len(cols):
+            return str(cols[idx])
+        return ""
+
+    def _populate_review_item_tree(self):
+        self.item_tree.delete(*self.item_tree.get_children())
+        for i, r in enumerate(self._review_rows):
+            cov = r.get("coverage_sf_per_ea")
+            noted_qty = r.get("noted_qty")
+            self.item_tree.insert(
+                "",
+                "end",
+                iid=str(i),
+                values=(
+                    r["item"],
+                    "" if cov is None else f"{cov:.3f}".rstrip("0").rstrip("."),
+                    "" if noted_qty is None else str(noted_qty),
+                    "" if r.get("send_qty") is None else str(r["send_qty"]),
+                    r.get("lot_number", ""),
+                    r.get("note", ""),
+                ),
+            )
+
+    def _refresh_review_row(self, idx: int):
+        r = self._review_rows[idx]
+        cov = r.get("coverage_sf_per_ea")
+        noted_qty = r.get("noted_qty")
+        self.item_tree.item(
+            str(idx),
+            values=(
+                r["item"],
+                "" if cov is None else f"{cov:.3f}".rstrip("0").rstrip("."),
+                "" if noted_qty is None else str(noted_qty),
+                "" if r.get("send_qty") is None else str(r["send_qty"]),
+                r.get("lot_number", ""),
+                r.get("note", ""),
+            ),
         )
-        self.wait_window(dlg)
-        if dlg.result is None:
+
+    def _on_review_item_double_click(self, event):
+        row_id = self.item_tree.identify_row(event.y)
+        col = self.item_tree.identify_column(event.x)
+        if not row_id:
+            return
+        idx = int(row_id)
+        col_name = self._review_tree_column_name(col)
+        if col_name == "noted_qty":
+            current = self._review_rows[idx].get("noted_qty")
+            win = tk.Toplevel(self)
+            win.title("Edit Send Qty")
+            win.transient(self.winfo_toplevel())
+            win.grab_set()
+            ttk.Label(
+                win,
+                text=f"{self._review_rows[idx]['item']} send qty (integer, blank to use Fallback Qty):",
+            ).pack(padx=10, pady=(10, 4))
+            var = tk.StringVar(value="" if current is None else str(current))
+            ent = ttk.Entry(win, textvariable=var, width=20)
+            ent.pack(padx=10, pady=(0, 10))
+            ent.focus_set()
+
+            def save_noted():
+                s = var.get().strip()
+                if not s:
+                    self._review_rows[idx]["noted_qty"] = None
+                    self._refresh_review_row(idx)
+                    win.destroy()
+                    return
+                try:
+                    v = int(s)
+                    if v <= 0:
+                        raise ValueError()
+                except Exception:
+                    messagebox.showerror(
+                        "Invalid qty",
+                        "Send Qty must be a positive integer (or blank to use Fallback Qty).",
+                        parent=win,
+                    )
+                    return
+                self._review_rows[idx]["noted_qty"] = v
+                self._refresh_review_row(idx)
+                win.destroy()
+
+            ttk.Button(win, text="Save", command=save_noted).pack(padx=10, pady=(0, 10))
+            win.bind("<Return>", lambda e: save_noted())
+            return
+
+        if col_name == "send_qty":
+            current = self._review_rows[idx].get("send_qty")
+            win = tk.Toplevel(self)
+            win.title("Edit Fallback Qty")
+            win.transient(self.winfo_toplevel())
+            win.grab_set()
+            ttk.Label(win, text=f"{self._review_rows[idx]['item']} fallback qty (integer):").pack(
+                padx=10, pady=(10, 4)
+            )
+            var = tk.StringVar(value="" if current is None else str(current))
+            ent = ttk.Entry(win, textvariable=var, width=20)
+            ent.pack(padx=10, pady=(0, 10))
+            ent.focus_set()
+
+            def save():
+                s = var.get().strip()
+                try:
+                    v = int(s)
+                    if v <= 0:
+                        raise ValueError()
+                except Exception:
+                    messagebox.showerror("Invalid qty", "Fallback Qty must be a positive integer.", parent=win)
+                    return
+                self._review_rows[idx]["send_qty"] = v
+                self._refresh_review_row(idx)
+                win.destroy()
+
+            ttk.Button(win, text="Save", command=save).pack(padx=10, pady=(0, 10))
+            win.bind("<Return>", lambda e: save())
+            return
+
+        if col_name == "lot":
+            current_lot = self._review_rows[idx].get("lot_number", "")
+            win = tk.Toplevel(self)
+            win.title("Edit Lot Number")
+            win.transient(self.winfo_toplevel())
+            win.grab_set()
+            ttk.Label(win, text=f"{self._review_rows[idx]['item']} lot number:").pack(padx=10, pady=(10, 4))
+            var = tk.StringVar(value=str(current_lot or ""))
+            ent = ttk.Entry(win, textvariable=var, width=30)
+            ent.pack(padx=10, pady=(0, 10))
+            ent.focus_set()
+
+            def save_lot():
+                self._review_rows[idx]["lot_number"] = var.get().strip()
+                self._refresh_review_row(idx)
+                win.destroy()
+
+            ttk.Button(win, text="Save", command=save_lot).pack(padx=10, pady=(0, 10))
+            win.bind("<Return>", lambda e: save_lot())
+
+    def _read_order_header_fields(self) -> tuple[str, str, str, str] | None:
+        scac = (self.scac_var.get() or "").strip()
+        if not scac:
+            messagebox.showerror("Missing SCAC", "Enter a SCAC value.")
             return None
-        return dlg.result, dlg.scac, dlg.ship_type, dlg.shipment_terms, dlg.delivery_service
+        ship_type = _ship_type_code_from_label(self.ship_type_var.get() or "")
+        if ship_type not in VALID_SHIP_TYPES:
+            messagebox.showerror("Invalid ship type", "Ship Type must be one of A, C, L, P, R, S, T.")
+            return None
+        shipment_terms = _shipment_terms_code_from_label(self.shipment_terms_var.get() or "")
+        if not shipment_terms:
+            messagebox.showerror("Missing shipment terms", "Select shipment terms.")
+            return None
+        delivery_service = (
+            _delivery_service_code_from_label(self.delivery_service_var.get() or "", self._delivery_service_options)
+            if self._delivery_service_options
+            else ""
+        )
+        return scac, ship_type, shipment_terms, delivery_service
+
+    def _collect_reviewed_lines_for_send(self) -> list[dict] | None:
+        out: list[dict] = []
+        for r in self._review_rows:
+            noted_qty = r.get("noted_qty")
+            qty = noted_qty if noted_qty is not None else r.get("send_qty")
+            if qty is None:
+                messagebox.showerror(
+                    "Missing qty",
+                    f"Missing qty for item {r['item']}. Set Send Qty or Fallback Qty.",
+                )
+                return None
+            normalized_lot = _normalize_lot_number(r.get("lot_number") or "")
+            if config.SYNAPSE_REQUIRE_LOT and not normalized_lot:
+                messagebox.showerror(
+                    "Missing lot number",
+                    f"Lot number is required for item {r['item']}. Double-click the Lot # cell to enter it.",
+                )
+                return None
+            out.append(
+                {
+                    "item": r["item"],
+                    "send_uom": r["send_uom"],
+                    "send_qty": qty,
+                    "lot_number": normalized_lot,
+                    "dtl_pass_thru_num_10": r.get("dtl_pass_thru_num_10"),
+                }
+            )
+        return out
+
+    def _restore_last_synapse_send_for_ship(self, ship_num: str):
+        stored = self.app.get_synapse_last_send(ship_num) or {}
+        self._last_synapse_payload = stored.get("payload")
+        self._last_synapse_response = stored.get("response")
 
     def _order_info_fields_for_current_ship(self) -> dict | None:
         ship_num = str(self.app.current_ship_num or "").strip()
@@ -1957,10 +2157,13 @@ class PalletDetailFrame(ttk.Frame):
         self.order_info_btn.config(state="normal" if enabled else "disabled")
 
     def _update_raw_btn_state(self):
+        ship_num = str(self.app.current_ship_num or "").strip()
+        stored = self.app.get_synapse_last_send(ship_num) if ship_num else None
         has_data = any(
             (
                 self._last_synapse_response,
                 self._last_synapse_payload,
+                stored and stored.get("payload"),
                 self._last_order_info_response,
                 self._last_order_info_payload,
                 self._order_info_fields_for_current_ship(),
@@ -2047,315 +2250,13 @@ class PalletDetailFrame(ttk.Frame):
         self.raw_text.pack(fill="both", expand=True)
         self.raw_text.delete("1.0", "end")
         self.raw_text.insert("1.0", json.dumps(bundle, indent=2, default=str))
-        self.toggle_raw_btn.config(text="Hide Synapse response")
+        self.toggle_raw_btn.config(text="Hide last payload")
         self._raw_visible = True
 
     def _hide_raw(self):
         self.raw_text.pack_forget()
-        self.toggle_raw_btn.config(text="Show Synapse response")
+        self.toggle_raw_btn.config(text="Show last payload")
         self._raw_visible = False
-
-
-class SynapseLinesDialog(tk.Toplevel):
-    def __init__(
-        self,
-        parent: ttk.Frame,
-        rows: list[dict],
-        initial_scac: str = "",
-        initial_ship_type: str = "",
-        initial_shipment_terms: str = "",
-        delivery_service_options: tuple[tuple[str, str], ...] = (),
-        initial_delivery_service: str = "",
-    ):
-        super().__init__(parent)
-        self.title("Review Synapse Order Lines")
-        self.geometry("1060x420")
-        self.resizable(True, True)
-        self.transient(parent.winfo_toplevel())
-        self.grab_set()
-
-        self.result: list[dict] | None = None
-        self.scac: str = ""
-        self.ship_type: str = ""
-        self.shipment_terms: str = ""
-        self.delivery_service: str = ""
-        self._delivery_service_options = tuple(delivery_service_options or ())
-        self._delivery_service_enabled = bool(self._delivery_service_options)
-        self._rows = rows
-
-        ttk.Label(
-            self,
-            text="Review and adjust the quantities that will be sent to Synapse.\n"
-            "Double-click Send Qty to edit. Qty must be an integer.",
-            justify="left",
-        ).pack(fill="x", padx=10, pady=(10, 6))
-        scac_row = ttk.Frame(self)
-        scac_row.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Label(scac_row, text="SCAC:").pack(side="left")
-        self.scac_var = tk.StringVar(value=(initial_scac or "").strip())
-        ttk.Entry(scac_row, textvariable=self.scac_var, width=16).pack(side="left", padx=(6, 0))
-        ttk.Label(scac_row, text="Ship Type:").pack(side="left", padx=(18, 6))
-        initial_ship_type = str(initial_ship_type or config.SYNAPSE_SHIP_TYPE).strip().upper()
-        if initial_ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
-            initial_ship_type = config.SYNAPSE_SHIP_TYPE
-        self.ship_type_var = tk.StringVar(value=_ship_type_label_from_code(initial_ship_type))
-        ttk.Combobox(
-            scac_row,
-            textvariable=self.ship_type_var,
-            width=24,
-            values=tuple(f"{code} - {desc}" for code, desc in SHIP_TYPE_OPTIONS),
-            state="readonly",
-        ).pack(side="left")
-        ttk.Label(scac_row, text="Shipment Terms:").pack(side="left", padx=(18, 6))
-        initial_terms_code = _normalize_terms(initial_shipment_terms) or (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
-        self.shipment_terms_var = tk.StringVar(value=_shipment_terms_label_from_code(initial_terms_code))
-        ttk.Combobox(
-            scac_row,
-            textvariable=self.shipment_terms_var,
-            width=28,
-            values=tuple(f"{code} - {desc}" for code, desc in SHIPMENT_TERMS_OPTIONS),
-            state="readonly",
-        ).pack(side="left")
-
-        delivery_row = ttk.Frame(self)
-        delivery_row.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Label(delivery_row, text="Delivery Service:").pack(side="left")
-        self.delivery_service_var = tk.StringVar(
-            value=_delivery_service_label_from_code(initial_delivery_service, self._delivery_service_options)
-            if self._delivery_service_enabled
-            else DELIVERY_SERVICE_NONE_LABEL
-        )
-        delivery_values = (
-            DELIVERY_SERVICE_NONE_LABEL,
-            *(f"{code} - {desc}" for code, desc in self._delivery_service_options),
-        )
-        self.delivery_service_combo = ttk.Combobox(
-            delivery_row,
-            textvariable=self.delivery_service_var,
-            width=40,
-            values=delivery_values,
-            state="readonly" if self._delivery_service_enabled else "disabled",
-        )
-        self.delivery_service_combo.pack(side="left", padx=(6, 0))
-        if not self._delivery_service_enabled:
-            ttk.Label(
-                delivery_row,
-                text="(FedEx / UPS only)",
-                foreground="#888888",
-            ).pack(side="left", padx=(8, 0))
-
-        cols = ("item", "fb_qty", "fb_uom", "coverage", "noted_qty", "send_qty", "send_uom", "lot", "note")
-        headers = ("Item", "FB Qty", "FB UOM", "SF per EA", "Noted Qty", "Send Qty", "Send UOM", "Lot #", "Note")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings")
-        for c, h in zip(cols, headers):
-            self.tree.heading(c, text=h)
-            self.tree.column(c, width=120, anchor="w")
-        self.tree.column("item", width=160)
-        self.tree.column("note", width=170)
-        self.tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        for i, r in enumerate(self._rows):
-            cov = r.get("coverage_sf_per_ea")
-            noted_qty = r.get("noted_qty")
-            self.tree.insert(
-                "",
-                "end",
-                iid=str(i),
-                values=(
-                    r["item"],
-                    f"{r['fb_qty']:.3f}".rstrip("0").rstrip("."),
-                    r["fb_uom"],
-                    "" if cov is None else f"{cov:.3f}".rstrip("0").rstrip("."),
-                    "" if noted_qty is None else str(noted_qty),
-                    "" if r.get("send_qty") is None else str(r["send_qty"]),
-                    r["send_uom"],
-                    r.get("lot_number", ""),
-                    r.get("note", ""),
-                ),
-            )
-
-        self.tree.bind("<Double-1>", self._on_double_click)
-
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right")
-        ttk.Button(btns, text="Send to Synapse", command=self._ok).pack(side="right", padx=(0, 8))
-
-    def _on_double_click(self, event):
-        row_id = self.tree.identify_row(event.y)
-        col = self.tree.identify_column(event.x)
-        if not row_id:
-            return
-        idx = int(row_id)
-        # #5 = noted_qty, #6 = send_qty, #8 = lot
-        if col == "#5":
-            current = self._rows[idx].get("noted_qty")
-
-            win = tk.Toplevel(self)
-            win.title("Edit Noted Qty")
-            win.transient(self)
-            win.grab_set()
-            ttk.Label(
-                win,
-                text=f"{self._rows[idx]['item']} noted qty (integer, blank to use Send Qty):",
-            ).pack(padx=10, pady=(10, 4))
-            var = tk.StringVar(value="" if current is None else str(current))
-            ent = ttk.Entry(win, textvariable=var, width=20)
-            ent.pack(padx=10, pady=(0, 10))
-            ent.focus_set()
-
-            def save_noted():
-                s = var.get().strip()
-                if not s:
-                    self._rows[idx]["noted_qty"] = None
-                    self._refresh_row(idx)
-                    win.destroy()
-                    return
-                try:
-                    v = int(s)
-                    if v <= 0:
-                        raise ValueError()
-                except Exception:
-                    messagebox.showerror(
-                        "Invalid qty",
-                        "Noted Qty must be a positive integer (or blank to use Send Qty).",
-                        parent=win,
-                    )
-                    return
-                self._rows[idx]["noted_qty"] = v
-                self._refresh_row(idx)
-                win.destroy()
-
-            ttk.Button(win, text="Save", command=save_noted).pack(padx=10, pady=(0, 10))
-            win.bind("<Return>", lambda e: save_noted())
-            return
-
-        if col == "#6":
-            current = self._rows[idx].get("send_qty")
-
-            win = tk.Toplevel(self)
-            win.title("Edit Send Qty")
-            win.transient(self)
-            win.grab_set()
-            ttk.Label(win, text=f"{self._rows[idx]['item']} send qty (integer):").pack(padx=10, pady=(10, 4))
-            var = tk.StringVar(value="" if current is None else str(current))
-            ent = ttk.Entry(win, textvariable=var, width=20)
-            ent.pack(padx=10, pady=(0, 10))
-            ent.focus_set()
-
-            def save():
-                s = var.get().strip()
-                try:
-                    v = int(s)
-                    if v <= 0:
-                        raise ValueError()
-                except Exception:
-                    messagebox.showerror("Invalid qty", "Send Qty must be a positive integer.", parent=win)
-                    return
-                self._rows[idx]["send_qty"] = v
-                self._refresh_row(idx)
-                win.destroy()
-
-            ttk.Button(win, text="Save", command=save).pack(padx=10, pady=(0, 10))
-            win.bind("<Return>", lambda e: save())
-            return
-
-        if col == "#8":
-            current_lot = self._rows[idx].get("lot_number", "")
-            win = tk.Toplevel(self)
-            win.title("Edit Lot Number")
-            win.transient(self)
-            win.grab_set()
-            ttk.Label(win, text=f"{self._rows[idx]['item']} lot number:").pack(padx=10, pady=(10, 4))
-            var = tk.StringVar(value=str(current_lot or ""))
-            ent = ttk.Entry(win, textvariable=var, width=30)
-            ent.pack(padx=10, pady=(0, 10))
-            ent.focus_set()
-
-            def save_lot():
-                self._rows[idx]["lot_number"] = var.get().strip()
-                self._refresh_row(idx)
-                win.destroy()
-
-            ttk.Button(win, text="Save", command=save_lot).pack(padx=10, pady=(0, 10))
-            win.bind("<Return>", lambda e: save_lot())
-
-    def _refresh_row(self, idx: int):
-        r = self._rows[idx]
-        cov = r.get("coverage_sf_per_ea")
-        noted_qty = r.get("noted_qty")
-        self.tree.item(
-            str(idx),
-            values=(
-                r["item"],
-                f"{r['fb_qty']:.3f}".rstrip("0").rstrip("."),
-                r["fb_uom"],
-                "" if cov is None else f"{cov:.3f}".rstrip("0").rstrip("."),
-                "" if noted_qty is None else str(noted_qty),
-                "" if r.get("send_qty") is None else str(r["send_qty"]),
-                r["send_uom"],
-                r.get("lot_number", ""),
-                r.get("note", ""),
-            ),
-        )
-
-    def _ok(self):
-        scac = (self.scac_var.get() or "").strip()
-        if not scac:
-            messagebox.showerror("Missing SCAC", "Enter a SCAC value.", parent=self)
-            return
-        ship_type = _ship_type_code_from_label(self.ship_type_var.get() or "")
-        if ship_type not in {"A", "C", "L", "P", "R", "S", "T"}:
-            messagebox.showerror("Invalid ship type", "Ship Type must be one of A, C, L, P, R, S, T.", parent=self)
-            return
-        shipment_terms = _shipment_terms_code_from_label(self.shipment_terms_var.get() or "")
-        if not shipment_terms:
-            messagebox.showerror("Missing shipment terms", "Select shipment terms.", parent=self)
-            return
-        out: list[dict] = []
-        for r in self._rows:
-            # Prefer the quantity parsed from the item's note when present;
-            # otherwise fall back to the Send Qty value.
-            noted_qty = r.get("noted_qty")
-            qty = noted_qty if noted_qty is not None else r.get("send_qty")
-            if qty is None:
-                messagebox.showerror(
-                    "Missing qty",
-                    f"Missing Send Qty for item {r['item']}. Double-click the Send Qty cell to enter it.",
-                    parent=self,
-                )
-                return
-            normalized_lot = _normalize_lot_number(r.get("lot_number") or "")
-            if config.SYNAPSE_REQUIRE_LOT and not normalized_lot:
-                messagebox.showerror(
-                    "Missing lot number",
-                    f"Lot number is required for item {r['item']}. Double-click the Lot # cell to enter it.",
-                    parent=self,
-                )
-                return
-            out.append(
-                {
-                    "item": r["item"],
-                    "send_uom": r["send_uom"],
-                    "send_qty": qty,
-                    "lot_number": normalized_lot,
-                    "dtl_pass_thru_num_10": r.get("dtl_pass_thru_num_10"),
-                }
-            )
-        self.scac = scac
-        self.ship_type = ship_type
-        self.shipment_terms = shipment_terms
-        self.delivery_service = (
-            _delivery_service_code_from_label(self.delivery_service_var.get() or "", self._delivery_service_options)
-            if self._delivery_service_enabled
-            else ""
-        )
-        self.result = out
-        self.destroy()
-
-    def _cancel(self):
-        self.result = None
-        self.destroy()
 
 
 if __name__ == "__main__":
