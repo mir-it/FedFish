@@ -97,20 +97,21 @@ def _normalize_lot_number(raw_lot) -> str:
 
 
 _NOTED_QTY_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:pieces|piece|pcs|pc|each|ea)\b",
+    r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:pieces|piece|pcs|pc|each|ea|sheets|sheet)\b",
     re.IGNORECASE,
 )
 
 
 def _parse_noted_qty(text: str):
-    """Pull a quantity like '100 pieces', '100pcs', '100 each', '100 ea' from a note.
+    """Pull a quantity like '100 pieces', '100pcs', '100 each', '100 ea', '100 sheets',
+    or '4,245 pieces' (commas as thousands separators) from a note.
 
     Returns an int (or float when fractional) when found, otherwise None.
     """
     m = _NOTED_QTY_RE.search(str(text or ""))
     if not m:
         return None
-    raw = m.group(1)
+    raw = m.group(1).replace(",", "")
     try:
         val = float(raw)
     except ValueError:
@@ -426,8 +427,12 @@ HEADER_UPPERCASE_FIELDS: set[str] = {
 HEADER_DATE_FIELDS: set[str] = set()
 
 
-def _split_ship_to_address(raw: str) -> tuple[str, str]:
+def _split_ship_to_address(raw: str, customer_name: str = "") -> tuple[str, str]:
     text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    # Only the "Ecom HD" customer splits a multi-line address into address_1 / address_2.
+    # For everyone else, keep the whole address on address_1 regardless of line count.
+    if str(customer_name or "").strip() != "Ecom HD":
+        return " ".join(line.strip() for line in text.split("\n") if line.strip()), ""
     if "\n" not in text:
         return text, ""
     first_line, rest = text.split("\n", 1)
@@ -1420,149 +1425,6 @@ class PalletDetailFrame(ttk.Frame):
                 )
         return review_lines
 
-    def _build_order_data(
-        self,
-        rows: list[dict],
-        ctx: dict,
-        reviewed: list[dict],
-        carrier: str,
-        ship_type_override: str = "",
-        shipment_terms_override: str = "",
-        delivery_service_override: str = "",
-        hdr_instructions: str = "",
-    ) -> dict:
-        if not rows:
-            raise ValueError("No items are loaded for this shipment yet.")
-        first = rows[0]
-        ship_row = ctx.get("ship", {}) or {}
-        so_row = ctx.get("so", {}) or {}
-        customer_row = ctx.get("customer", {}) or {}
-        po_number = str(first.get("po_number") or "").strip()
-        if not po_number:
-            raise ValueError("This shipment has no PO number in Fishbowl.")
-        ship_num_value = _synapse_reference_from_ship_num(
-            _row_get_any(so_row, "num") or self.app.current_ship_num
-        )
-
-        ship_to_name = str(_row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or "").strip() or "SHIP TO"
-        ship_to_name = ship_to_name[:40]
-        ship_to_address_1, ship_to_address_2 = _split_ship_to_address(
-            _row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or ""
-        )
-        ship_to_city = str(_row_get_any(ship_row, "shipToCity") or first.get("city") or "").strip()
-        ship_to_state = self._ship_to_state_code(ship_row, str(first.get("state") or ""))
-        ship_to_postal_code = str(_row_get_any(ship_row, "shipToZip", "shipToPostalCode") or first.get("zip") or "").strip()
-        if not all([ship_to_address_1, ship_to_city, ship_to_state, ship_to_postal_code]):
-            raise ValueError("Fishbowl is missing one or more ship-to fields (address/city/state/zip) for this shipment.")
-
-        details = [
-            {
-                "item": r["item"],
-                "uom_entered": r["send_uom"],
-                "qty_entered": r["send_qty"],
-                "dtl_pass_thru_num_10": r.get("dtl_pass_thru_num_10"),
-                "lot_number": _normalize_lot_number(r.get("lot_number", "")),
-            }
-            for r in reviewed
-        ]
-        if not details:
-            raise ValueError("Could not build any detail lines from Fishbowl items.")
-
-        ship_date = self._ship_date_from_soitem_rows(rows)
-        if not ship_date:
-            raise ValueError("Missing soitem.dateScheduledFulfillment for this shipment.")
-        shipment_terms = _normalize_terms(
-            str(_row_get_any(so_row, "shipmentTerms", "shipTerms", "freightTerms", "termCode") or "")
-        )
-        if not shipment_terms:
-            third_party_flag = _to_boolish(_row_get_any(so_row, "isThirdParty", "thirdPartyBilling", "thirdParty"))
-            shipment_terms = "3RD" if third_party_flag else (config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper()
-        if shipment_terms_override:
-            shipment_terms = _normalize_terms(shipment_terms_override) or shipment_terms
-
-        carrier_name = next((str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()), "")
-        if not shipment_terms_override and _shipment_terms_from_carrier_name(carrier_name):
-            shipment_terms = "3RD"
-        ship_type = str(ship_type_override or self.app.resolve_ship_type_for_carrier(carrier_name) or config.SYNAPSE_SHIP_TYPE).strip().upper()
-        if ship_type not in VALID_SHIP_TYPES:
-            ship_type = config.SYNAPSE_SHIP_TYPE
-
-        bill_to_name = str(_row_get_any(so_row, "billToName") or _row_get_any(customer_row, "name") or config.SYNAPSE_BILLTO_NAME or "").strip()[:40]
-        bill_to_address_1 = str(_row_get_any(so_row, "billToAddress", "billToAddress1") or config.SYNAPSE_BILLTO_ADDRESS_1 or "").strip()
-        bill_to_city = str(_row_get_any(so_row, "billToCity") or config.SYNAPSE_BILLTO_CITY or "").strip()
-        bill_to_state = str(_row_get_any(so_row, "billToState") or "").strip()
-        if not bill_to_state:
-            bill_to_state_id = _row_get_any(so_row, "billToStateId")
-            if bill_to_state_id not in (None, ""):
-                bill_to_state = self._state_code_from_id(bill_to_state_id)
-        if not bill_to_state:
-            bill_to_state = str(_row_get_any(customer_row, "state") or "").strip()
-        if not bill_to_state:
-            bill_to_state = str(config.SYNAPSE_BILLTO_STATE or "").strip()
-        bill_to_postal_code = str(_row_get_any(so_row, "billToZip", "billToPostalCode") or config.SYNAPSE_BILLTO_POSTAL_CODE or "").strip()
-        bill_to_country_code = _normalize_country(
-            _row_get_any(so_row, "billToCountry", "billToCountryCode") or config.SYNAPSE_BILLTO_COUNTRY_CODE or "USA"
-        )
-
-        order_data = {
-            "header": {
-                "func": "A",
-                "custid": config.SYNAPSE_CUSTID,
-                "po_number": po_number,
-                "order_type": "O",
-                "reference": ship_num_value,
-                "from_facility": config.SYNAPSE_FROM_FACILITY,
-                "carrier": carrier,
-                "ship_type": ship_type,
-                "shipment_terms": shipment_terms or config.SYNAPSE_SHIPMENT_TERMS,
-                "ship_date": ship_date,
-                "ship_to_name": ship_to_name,
-                "ship_to_address_1": ship_to_address_1,
-                "ship_to_city": ship_to_city,
-                "ship_to_state": ship_to_state,
-                "ship_to_postal_code": ship_to_postal_code,
-                "ship_to_country_code": "USA",
-            },
-            "details": details,
-        }
-        if ship_to_address_2:
-            order_data["header"]["ship_to_address_2"] = ship_to_address_2
-        consignee = _consignee_for_carrier(
-            carrier_name, str(_row_get_any(customer_row, "name") or "").strip()
-        )
-        if consignee:
-            order_data["header"]["consignee"] = consignee
-        delivery_service = str(delivery_service_override or "").strip()
-        if not delivery_service:
-            delivery_service = _delivery_service_from_fishbowl_carrier(
-                carrier_name, _fishbowl_carrier_service_name(ctx)
-            )
-        if delivery_service:
-            order_data["header"]["delivery_service"] = delivery_service
-        if (shipment_terms or config.SYNAPSE_SHIPMENT_TERMS or "").strip().upper() == "3RD":
-            order_data["header"].update(
-                {
-                    "bill_to_name": bill_to_name,
-                    "bill_to_address_1": bill_to_address_1,
-                    "bill_to_city": bill_to_city,
-                    "bill_to_state": bill_to_state,
-                    "bill_to_postal_code": bill_to_postal_code,
-                    "bill_to_country_code": bill_to_country_code,
-                }
-            )
-        order_data["header"] = _apply_header_field_limits(order_data["header"])
-        instructions_text = str(hdr_instructions or "").strip()
-        if instructions_text:
-            header_reference = str(order_data.get("header", {}).get("reference") or "").strip()
-            header_po_number = str(order_data.get("header", {}).get("po_number") or "").strip()
-            order_data["hdrinstruct"] = {
-                "custid": "MIRMOS",
-                "reference": header_reference,
-                "po_number": header_po_number,
-                "instructions": instructions_text[:255],
-            }
-        return order_data
-
     def _create_synapse_order(self):
         if not config.SYNAPSE_USERNAME or not config.SYNAPSE_PASSWORD:
             messagebox.showerror(
@@ -1598,7 +1460,8 @@ class PalletDetailFrame(ttk.Frame):
         ).strip() or "SHIP TO"
         ship_to_name = ship_to_name[:40]
         ship_to_address_1, ship_to_address_2 = _split_ship_to_address(
-            _row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or ""
+            _row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or "",
+            str(_row_get_any(customer_row, "name") or "").strip(),
         )
         ship_to_city = str(_row_get_any(ship_row, "shipToCity") or first.get("city") or "").strip()
         ship_to_state = self._ship_to_state_code(ship_row, str(first.get("state") or ""))
@@ -1917,11 +1780,15 @@ class PalletDetailFrame(ttk.Frame):
                 send_qty = int(fb_qty) if float(fb_qty).is_integer() else None
                 if send_qty is None:
                     note = "Needs integer"
+                else:
+                    note = f"{fb_uom} used as-is (no conversion)"
             elif fb_uom == "BOX":
                 send_uom = "BOX"
                 send_qty = int(fb_qty) if float(fb_qty).is_integer() else None
                 if send_qty is None:
                     note = "Needs integer"
+                else:
+                    note = "BOX used as-is (no conversion)"
             else:
                 note = "Review"
 
