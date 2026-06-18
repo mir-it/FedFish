@@ -1,10 +1,12 @@
 import json
 import queue
 import re
+import smtplib
 import threading
 import tkinter as tk
+from email.message import EmailMessage
 from pathlib import Path
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from datetime import date, datetime
 
 import config
@@ -28,6 +30,38 @@ def _row_get_any(row: dict | None, *keys: str):
 def _to_boolish(value) -> bool:
     s = str(value or "").strip().upper()
     return s in {"Y", "YES", "TRUE", "1", "T"}
+
+
+def _send_pdf_email(to_addr: str, subject: str, body: str, attachment_path: str):
+    """Send a single PDF attachment over SMTP (Gmail-compatible, STARTTLS).
+
+    Raises on failure so the caller can surface the error to the user.
+    """
+    if not config.SMTP_USERNAME or not config.SMTP_PASSWORD:
+        raise ValueError("SMTP_USERNAME / SMTP_PASSWORD are not set in your .env.")
+    if not to_addr:
+        raise ValueError("No recipient email address.")
+
+    path = Path(attachment_path)
+    if not path.is_file():
+        raise ValueError(f"Attachment not found: {attachment_path}")
+
+    msg = EmailMessage()
+    msg["From"] = config.SMTP_FROM or config.SMTP_USERNAME
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(body or "")
+    msg.add_attachment(
+        path.read_bytes(),
+        maintype="application",
+        subtype="pdf",
+        filename=path.name,
+    )
+
+    with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=30) as server:
+        server.starttls()
+        server.login(config.SMTP_USERNAME, config.SMTP_PASSWORD)
+        server.send_message(msg)
 
 
 def _parse_fb_date(value) -> date | None:
@@ -1212,6 +1246,12 @@ class PalletDetailFrame(ttk.Frame):
             state="disabled",
         )
         self.order_info_btn.pack(side="left", padx=(8, 0))
+        self.email_bol_btn = ttk.Button(
+            actions,
+            text="Email BOL to NJ Warehouse",
+            command=self._email_bol_to_warehouse,
+        )
+        self.email_bol_btn.pack(side="left", padx=(8, 0))
         self.toggle_raw_btn = ttk.Button(
             actions,
             text="Show last payload",
@@ -1956,6 +1996,104 @@ class PalletDetailFrame(ttk.Frame):
 
             ttk.Button(win, text="Save", command=save_lot).pack(padx=10, pady=(0, 10))
             win.bind("<Return>", lambda e: save_lot())
+
+    def _email_bol_to_warehouse(self):
+        to_addr = (config.NJ_WAREHOUSE_EMAIL or "").strip()
+        if not to_addr:
+            messagebox.showerror(
+                "Warehouse email not set",
+                "NJ_WAREHOUSE_EMAIL is not set in your .env. Add it and restart the app.",
+            )
+            return
+        if not config.SMTP_USERNAME or not config.SMTP_PASSWORD:
+            messagebox.showerror(
+                "Email not configured",
+                "Set SMTP_USERNAME and SMTP_PASSWORD in your .env (and restart the app).",
+            )
+            return
+
+        pdf_path = filedialog.askopenfilename(
+            title="Select BOL PDF to email",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if not pdf_path:
+            return
+
+        ship_num = str(self.app.current_ship_num or "").strip()
+        rows = self.app.current_items or []
+        po_number = str((rows[0].get("po_number") if rows else "") or "").strip()
+
+        subject_default = f"BOL - Ship #{ship_num}" + (f" / PO {po_number}" if po_number else "")
+        body_default = (
+            f"Please find attached the BOL for Ship #{ship_num}"
+            + (f" (PO {po_number})" if po_number else "")
+            + ".\n\nThank you."
+        )
+        self._open_bol_email_dialog(to_addr, subject_default, body_default, pdf_path)
+
+    def _open_bol_email_dialog(self, to_addr: str, subject_default: str, body_default: str, pdf_path: str):
+        win = tk.Toplevel(self)
+        win.title("Email BOL to NJ Warehouse")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="To:").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(frm, text=to_addr).grid(row=0, column=1, sticky="w", pady=(0, 4))
+
+        ttk.Label(frm, text="Subject:").grid(row=1, column=0, sticky="w", pady=(0, 4))
+        subject_var = tk.StringVar(value=subject_default)
+        subject_ent = ttk.Entry(frm, textvariable=subject_var, width=60)
+        subject_ent.grid(row=1, column=1, sticky="we", pady=(0, 4))
+
+        ttk.Label(frm, text="Attachment:").grid(row=2, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(frm, text=Path(pdf_path).name).grid(row=2, column=1, sticky="w", pady=(0, 4))
+
+        ttk.Label(frm, text="Message:").grid(row=3, column=0, sticky="nw", pady=(0, 4))
+        body_text = tk.Text(frm, width=60, height=8, wrap="word")
+        body_text.insert("1.0", body_default)
+        body_text.grid(row=3, column=1, sticky="we", pady=(0, 4))
+
+        frm.columnconfigure(1, weight=1)
+
+        btn_row = ttk.Frame(frm)
+        btn_row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(8, 0))
+
+        def do_send():
+            subject = subject_var.get().strip()
+            body = body_text.get("1.0", "end").strip()
+            send_btn.config(state="disabled")
+            cancel_btn.config(state="disabled")
+            self.app.set_status("Sending BOL email...")
+
+            def work():
+                _send_pdf_email(to_addr, subject, body, pdf_path)
+                return True
+
+            def ok(_):
+                self.app.set_status(f"BOL emailed to {to_addr}.")
+                win.destroy()
+                messagebox.showinfo("Email sent", f"BOL emailed to {to_addr}.")
+
+            def err(e):
+                self.app.set_status("Failed to send BOL email.")
+                send_btn.config(state="normal")
+                cancel_btn.config(state="normal")
+                messagebox.showerror(
+                    "Email failed",
+                    f"Could not send the BOL email.\n\n{e}",
+                    parent=win,
+                )
+
+            self.app.run_async(work, ok, err)
+
+        cancel_btn = ttk.Button(btn_row, text="Cancel", command=win.destroy)
+        cancel_btn.pack(side="right", padx=(8, 0))
+        send_btn = ttk.Button(btn_row, text="Send", command=do_send)
+        send_btn.pack(side="right")
+        subject_ent.focus_set()
 
     def _read_order_header_fields(self) -> tuple[str, str, str, str] | None:
         scac = (self.scac_var.get() or "").strip()

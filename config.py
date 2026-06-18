@@ -62,6 +62,17 @@ PRODUCT_COVERAGE_CSV = _product_csv
 # Comma-separated keywords matched against item number (case-insensitive).
 EXCLUDE_ITEM_KEYWORDS = _get("EXCLUDE_ITEM_KEYWORDS", "shipping,freight,fee")
 
+# Email (SMTP) used to send BOL PDF attachments to the warehouse.
+# For Gmail/Google Workspace, SMTP_PASSWORD must be a 16-char App Password.
+SMTP_HOST = _get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(_get("SMTP_PORT", "587") or "587")
+SMTP_USERNAME = _get("SMTP_USERNAME", "")
+SMTP_PASSWORD = _get("SMTP_PASSWORD", "")
+# Address shown as the sender; defaults to the login user when unset.
+SMTP_FROM = _get("SMTP_FROM", "") or SMTP_USERNAME
+# Destination for the "Email BOL to NJ Warehouse" button.
+NJ_WAREHOUSE_EMAIL = _get("NJ_WAREHOUSE_EMAIL", "")
+
 APP_NAME = "BOL_Automator"
 APP_DESCRIPTION = "LTL Shipping Automation"
 APP_ID = 101
