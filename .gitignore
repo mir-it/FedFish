@@ -20,3 +20,4 @@ synapse_last_send_map.txt
 # OS / editor cruft
 .DS_Store
 Thumbs.db
+.env
