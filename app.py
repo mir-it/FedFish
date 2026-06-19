@@ -32,9 +32,11 @@ def _to_boolish(value) -> bool:
     return s in {"Y", "YES", "TRUE", "1", "T"}
 
 
-def _send_pdf_email(to_addr: str, subject: str, body: str, attachment_path: str):
-    """Send a single PDF attachment over SMTP (Gmail-compatible, STARTTLS).
+def _send_pdf_email(to_addr: str, subject: str, body: str, attachment_paths, cc_addrs=None):
+    """Send one or more PDF attachments over SMTP (Gmail-compatible, STARTTLS).
 
+    ``attachment_paths`` may be a single path or a list of paths.
+    ``cc_addrs`` may be a list of CC recipients.
     Raises on failure so the caller can surface the error to the user.
     """
     if not config.SMTP_USERNAME or not config.SMTP_PASSWORD:
@@ -42,26 +44,38 @@ def _send_pdf_email(to_addr: str, subject: str, body: str, attachment_path: str)
     if not to_addr:
         raise ValueError("No recipient email address.")
 
-    path = Path(attachment_path)
-    if not path.is_file():
-        raise ValueError(f"Attachment not found: {attachment_path}")
+    if isinstance(attachment_paths, (str, Path)):
+        attachment_paths = [attachment_paths]
+    attachment_paths = [p for p in (attachment_paths or []) if str(p).strip()]
+    if not attachment_paths:
+        raise ValueError("No attachments selected.")
+
+    cc_addrs = [a.strip() for a in (cc_addrs or []) if a and a.strip()]
 
     msg = EmailMessage()
     msg["From"] = config.SMTP_FROM or config.SMTP_USERNAME
     msg["To"] = to_addr
+    if cc_addrs:
+        msg["Cc"] = ", ".join(cc_addrs)
     msg["Subject"] = subject
     msg.set_content(body or "")
-    msg.add_attachment(
-        path.read_bytes(),
-        maintype="application",
-        subtype="pdf",
-        filename=path.name,
-    )
 
+    for ap in attachment_paths:
+        path = Path(ap)
+        if not path.is_file():
+            raise ValueError(f"Attachment not found: {ap}")
+        msg.add_attachment(
+            path.read_bytes(),
+            maintype="application",
+            subtype="pdf",
+            filename=path.name,
+        )
+
+    recipients = [to_addr] + cc_addrs
     with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=30) as server:
         server.starttls()
         server.login(config.SMTP_USERNAME, config.SMTP_PASSWORD)
-        server.send_message(msg)
+        server.send_message(msg, to_addrs=recipients)
 
 
 def _parse_fb_date(value) -> date | None:
@@ -2012,45 +2026,53 @@ class PalletDetailFrame(ttk.Frame):
             )
             return
 
-        pdf_path = filedialog.askopenfilename(
-            title="Select BOL PDF to email",
+        pdf_paths = filedialog.askopenfilenames(
+            title="Select PDF(s) to email",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
-        if not pdf_path:
+        if not pdf_paths:
             return
+        pdf_paths = list(pdf_paths)
 
         ship_num = str(self.app.current_ship_num or "").strip()
         rows = self.app.current_items or []
-        po_number = str((rows[0].get("po_number") if rows else "") or "").strip()
 
         subject_default = f"NJ - New Order # {ship_num}".strip()
 
+        carrier_name = next(
+            (str(r.get("carrier_name") or "").strip() for r in rows if str(r.get("carrier_name") or "").strip()),
+            "",
+        )
+
         item_lines = []
-        for r in getattr(self, "_review_rows", None) or []:
-            noted = r.get("noted_qty")
-            qty = noted if noted is not None else r.get("send_qty")
-            qty_text = "" if qty is None else str(qty)
-            uom = str(r.get("send_uom") or "").strip()
-            item_lines.append(" ".join(p for p in (str(r.get("item") or "").strip(), qty_text, uom) if p))
-        items_text = "\n".join(item_lines) if item_lines else "*insert items / noted quantities*"
+        seen = set()
+        for r in rows:
+            item = str(_row_get_any(r, "item_num") or "").strip()
+            if not item:
+                continue
+            note = str(_row_get_any(r, "soitem_note") or "").strip()
+            key = (item, note)
+            if key in seen:
+                continue
+            seen.add(key)
+            item_lines.append(f"{item} - {note}" if note else item)
+        items_text = "\n".join(item_lines) if item_lines else "*items*"
 
         body_default = (
-            "Hello,\n"
-            "Please find the attached packing slip and porcelain packing instructions.\n"
-            "Please pack well and send us the weight and dimensions.\n"
-            "Please print and include a physical packing slip with the shipment.\n"
-            "We'll get a BOL over to you for this shipment.\n"
-            "Additionally, please send a photo of the pallet packed prior to shipping.\n\n"
-            "PLEASE SHIP:\n\n"
-            f"{items_text}\n\n"
-            "Thank you.\n"
-            "Best Regards,"
+            "Hello,\n\n"
+            f"Please find the new order attached. Please pack well and ship via {carrier_name}\n\n"
+            f"{items_text}\n"
         )
-        self._open_bol_email_dialog(to_addr, subject_default, body_default, pdf_path)
+        cc_default = (config.NJ_WAREHOUSE_CC or "").strip()
+        self._open_bol_email_dialog(to_addr, subject_default, body_default, pdf_paths, cc_default)
 
-    def _open_bol_email_dialog(self, to_addr: str, subject_default: str, body_default: str, pdf_path: str):
+    def _open_bol_email_dialog(self, to_addr: str, subject_default: str, body_default: str, pdf_paths, cc_default: str = ""):
+        if isinstance(pdf_paths, (str, Path)):
+            pdf_paths = [pdf_paths]
+        pdf_paths = list(pdf_paths or [])
+
         win = tk.Toplevel(self)
-        win.title("Email BOL to NJ Warehouse")
+        win.title("Email PDF to NJ")
         win.transient(self.winfo_toplevel())
         win.grab_set()
 
@@ -2060,47 +2082,54 @@ class PalletDetailFrame(ttk.Frame):
         ttk.Label(frm, text="To:").grid(row=0, column=0, sticky="w", pady=(0, 4))
         ttk.Label(frm, text=to_addr).grid(row=0, column=1, sticky="w", pady=(0, 4))
 
-        ttk.Label(frm, text="Subject:").grid(row=1, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(frm, text="Cc:").grid(row=1, column=0, sticky="w", pady=(0, 4))
+        cc_var = tk.StringVar(value=cc_default)
+        cc_ent = ttk.Entry(frm, textvariable=cc_var, width=60)
+        cc_ent.grid(row=1, column=1, sticky="we", pady=(0, 4))
+
+        ttk.Label(frm, text="Subject:").grid(row=2, column=0, sticky="w", pady=(0, 4))
         subject_var = tk.StringVar(value=subject_default)
         subject_ent = ttk.Entry(frm, textvariable=subject_var, width=60)
-        subject_ent.grid(row=1, column=1, sticky="we", pady=(0, 4))
+        subject_ent.grid(row=2, column=1, sticky="we", pady=(0, 4))
 
-        ttk.Label(frm, text="Attachment:").grid(row=2, column=0, sticky="w", pady=(0, 4))
-        ttk.Label(frm, text=Path(pdf_path).name).grid(row=2, column=1, sticky="w", pady=(0, 4))
+        ttk.Label(frm, text="Attachments:").grid(row=3, column=0, sticky="nw", pady=(0, 4))
+        attach_text = "\n".join(Path(p).name for p in pdf_paths) or "(none)"
+        ttk.Label(frm, text=attach_text, justify="left").grid(row=3, column=1, sticky="w", pady=(0, 4))
 
-        ttk.Label(frm, text="Message:").grid(row=3, column=0, sticky="nw", pady=(0, 4))
-        body_text = tk.Text(frm, width=60, height=8, wrap="word")
+        ttk.Label(frm, text="Message:").grid(row=4, column=0, sticky="nw", pady=(0, 4))
+        body_text = tk.Text(frm, width=60, height=10, wrap="word")
         body_text.insert("1.0", body_default)
-        body_text.grid(row=3, column=1, sticky="we", pady=(0, 4))
+        body_text.grid(row=4, column=1, sticky="we", pady=(0, 4))
 
         frm.columnconfigure(1, weight=1)
 
         btn_row = ttk.Frame(frm)
-        btn_row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        btn_row.grid(row=5, column=0, columnspan=2, sticky="e", pady=(8, 0))
 
         def do_send():
             subject = subject_var.get().strip()
             body = body_text.get("1.0", "end").strip()
+            cc_addrs = [a for a in re.split(r"[,;]", cc_var.get()) if a.strip()]
             send_btn.config(state="disabled")
             cancel_btn.config(state="disabled")
-            self.app.set_status("Sending BOL email...")
+            self.app.set_status("Sending email...")
 
             def work():
-                _send_pdf_email(to_addr, subject, body, pdf_path)
+                _send_pdf_email(to_addr, subject, body, pdf_paths, cc_addrs)
                 return True
 
             def ok(_):
-                self.app.set_status(f"BOL emailed to {to_addr}.")
+                self.app.set_status(f"Email sent to {to_addr}.")
                 win.destroy()
-                messagebox.showinfo("Email sent", f"BOL emailed to {to_addr}.")
+                messagebox.showinfo("Email sent", f"Email sent to {to_addr}.")
 
             def err(e):
-                self.app.set_status("Failed to send BOL email.")
+                self.app.set_status("Failed to send email.")
                 send_btn.config(state="normal")
                 cancel_btn.config(state="normal")
                 messagebox.showerror(
                     "Email failed",
-                    f"Could not send the BOL email.\n\n{e}",
+                    f"Could not send the email.\n\n{e}",
                     parent=win,
                 )
 

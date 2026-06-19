@@ -70,8 +70,10 @@ SMTP_USERNAME = _get("SMTP_USERNAME", "")
 SMTP_PASSWORD = _get("SMTP_PASSWORD", "")
 # Address shown as the sender; defaults to the login user when unset.
 SMTP_FROM = _get("SMTP_FROM", "") or SMTP_USERNAME
-# Destination for the "Email BOL to NJ Warehouse" button.
+# Destination for the "Email PDF to NJ" button.
 NJ_WAREHOUSE_EMAIL = _get("NJ_WAREHOUSE_EMAIL", "")
+# Optional default CC recipients (comma or semicolon separated).
+NJ_WAREHOUSE_CC = _get("NJ_WAREHOUSE_CC", "")
 
 APP_NAME = "BOL_Automator"
 APP_DESCRIPTION = "LTL Shipping Automation"
