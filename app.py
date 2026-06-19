@@ -1248,7 +1248,7 @@ class PalletDetailFrame(ttk.Frame):
         self.order_info_btn.pack(side="left", padx=(8, 0))
         self.email_bol_btn = ttk.Button(
             actions,
-            text="Email BOL to NJ Warehouse",
+            text="Email PDF to NJ",
             command=self._email_bol_to_warehouse,
         )
         self.email_bol_btn.pack(side="left", padx=(8, 0))
@@ -2023,11 +2023,28 @@ class PalletDetailFrame(ttk.Frame):
         rows = self.app.current_items or []
         po_number = str((rows[0].get("po_number") if rows else "") or "").strip()
 
-        subject_default = f"BOL - Ship #{ship_num}" + (f" / PO {po_number}" if po_number else "")
+        subject_default = f"NJ - New Order # {ship_num}".strip()
+
+        item_lines = []
+        for r in getattr(self, "_review_rows", None) or []:
+            noted = r.get("noted_qty")
+            qty = noted if noted is not None else r.get("send_qty")
+            qty_text = "" if qty is None else str(qty)
+            uom = str(r.get("send_uom") or "").strip()
+            item_lines.append(" ".join(p for p in (str(r.get("item") or "").strip(), qty_text, uom) if p))
+        items_text = "\n".join(item_lines) if item_lines else "*insert items / noted quantities*"
+
         body_default = (
-            f"Please find attached the BOL for Ship #{ship_num}"
-            + (f" (PO {po_number})" if po_number else "")
-            + ".\n\nThank you."
+            "Hello,\n"
+            "Please find the attached packing slip and porcelain packing instructions.\n"
+            "Please pack well and send us the weight and dimensions.\n"
+            "Please print and include a physical packing slip with the shipment.\n"
+            "We'll get a BOL over to you for this shipment.\n"
+            "Additionally, please send a photo of the pallet packed prior to shipping.\n\n"
+            "PLEASE SHIP:\n\n"
+            f"{items_text}\n\n"
+            "Thank you.\n"
+            "Best Regards,"
         )
         self._open_bol_email_dialog(to_addr, subject_default, body_default, pdf_path)
 
