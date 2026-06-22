@@ -2062,6 +2062,7 @@ class PalletDetailFrame(ttk.Frame):
             "Hello,\n\n"
             f"Please find the new order attached. Please pack well and ship via {carrier_name}\n\n"
             f"{items_text}\n"
+            f"\nThank You,\nBest Regards"
         )
         cc_default = (config.NJ_WAREHOUSE_CC or "").strip()
         self._open_bol_email_dialog(to_addr, subject_default, body_default, pdf_paths, cc_default)
