@@ -386,8 +386,8 @@ def _consignee_for_carrier(raw_name: str, customer_name: str = "") -> str:
 
 
 def _fishbowl_carrier_service_name(ctx: dict) -> str:
-    ship_row = (ctx or {}).get("ship", {}) or {}
-    return str(_row_get_any(ship_row, "carrier_service_name", "carrierServiceName") or "").strip()
+    so_row = (ctx or {}).get("so", {}) or {}
+    return str(_row_get_any(so_row, "carrier_service_name", "carrierServiceName") or "").strip()
 
 
 def _delivery_service_from_fishbowl_carrier(carrier_name: str, service_name: str = "") -> str:
@@ -960,8 +960,8 @@ class ShipmentsFrame(ttk.Frame):
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
-        cols = ("ship_num", "customer", "salesperson", "city", "state", "zip", "carrier", "synapse_status")
-        headers = ("Ship #", "Customer", "Salesperson", "City", "State", "Zip", "Carrier", "Synapse")
+        cols = ("so_num", "customer", "salesperson", "city", "state", "zip", "carrier", "synapse_status")
+        headers = ("SO #", "Customer", "Salesperson", "City", "State", "Zip", "Carrier", "Synapse")
         self._status_col_idx = len(cols) - 1
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
         for c, h in zip(cols, headers):
@@ -1016,7 +1016,7 @@ class ShipmentsFrame(ttk.Frame):
             rows = self.app.fb.data_query(queries.SHIPMENTS_SQL)
             grouped: dict[str, list[dict]] = {}
             for r in rows:
-                grouped.setdefault(r["ship_num"], []).append(r)
+                grouped.setdefault(r["so_num"], []).append(r)
             collected_rows: list[dict] = []
             for num, pallets in grouped.items():
                 first = pallets[0]
@@ -1026,7 +1026,7 @@ class ShipmentsFrame(ttk.Frame):
                 )
                 collected_rows.append(
                     {
-                        "ship_num": str(num),
+                        "so_num": str(num),
                         "customer": self._extract_customer(first),
                         "salesperson": self._extract_salesperson(first),
                         "city": str(first.get("city", "") or ""),
@@ -1098,16 +1098,16 @@ class ShipmentsFrame(ttk.Frame):
             salesperson = str(row.get("salesperson") or "").strip()
             if selected and selected != "All Salespeople" and salesperson != selected:
                 continue
-            ship_num = str(row.get("ship_num") or "")
-            if search and search not in ship_num.lower():
+            so_num = str(row.get("so_num") or "")
+            if search and search not in so_num.lower():
                 continue
-            status_text, tags = self._status_text_and_tags_for_ship(ship_num)
+            status_text, tags = self._status_text_and_tags_for_ship(so_num)
             self.tree.insert(
                 "",
                 "end",
-                iid=ship_num,
+                iid=so_num,
                 values=(
-                    ship_num,
+                    so_num,
                     row.get("customer", ""),
                     salesperson,
                     row.get("city", ""),
@@ -1357,10 +1357,10 @@ class PalletDetailFrame(ttk.Frame):
         row = self._query_first(queries.state_code_sql_for(state_int))
         return str(_row_get_any(row, "code") or "").strip()
 
-    def _ship_to_state_code(self, ship_row: dict, fallback_state: str = "") -> str:
-        state = str(_row_get_any(ship_row, "shipToState") or fallback_state or "").strip()
+    def _ship_to_state_code(self, address_row: dict, fallback_state: str = "") -> str:
+        state = str(_row_get_any(address_row, "shipToState") or fallback_state or "").strip()
         if not state:
-            state_id = _row_get_any(ship_row, "shipToStateId")
+            state_id = _row_get_any(address_row, "shipToStateId")
             if state_id not in (None, ""):
                 state = self._state_code_from_id(state_id)
         # Some Fishbowl schemas expose numeric state IDs in shipToState.
@@ -1371,7 +1371,6 @@ class PalletDetailFrame(ttk.Frame):
         return state
 
     def _load_order_context(self, ship_num: str) -> dict:
-        ship_row = self._query_first(queries.ship_sql_for(ship_num))
         so_row = self._query_first(queries.so_sql_for(ship_num))
         customer_row = {}
         customer_id = _row_get_any(so_row, "customerId", "customerid", "customer")
@@ -1381,7 +1380,6 @@ class PalletDetailFrame(ttk.Frame):
             except Exception:
                 customer_row = {}
         return {
-            "ship": ship_row,
             "so": so_row,
             "customer": customer_row,
         }
@@ -1498,7 +1496,6 @@ class PalletDetailFrame(ttk.Frame):
         rows = self.app.current_items
         ctx = self.app.current_order_context or {}
         first = rows[0]
-        ship_row = ctx.get("ship", {}) or {}
         so_row = ctx.get("so", {}) or {}
         customer_row = ctx.get("customer", {}) or {}
         po_number = str(first.get("po_number") or "").strip()
@@ -1510,17 +1507,17 @@ class PalletDetailFrame(ttk.Frame):
         )
 
         ship_to_name = str(
-            _row_get_any(ship_row, "shipToName") or first.get("ship_to_name") or ""
+            _row_get_any(so_row, "shipToName") or first.get("ship_to_name") or ""
         ).strip() or "SHIP TO"
         ship_to_name = ship_to_name[:40]
         ship_to_address_1, ship_to_address_2 = _split_ship_to_address(
-            _row_get_any(ship_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or "",
+            _row_get_any(so_row, "shipToAddress", "shipToAddress1") or first.get("address_1") or "",
             str(_row_get_any(customer_row, "name") or "").strip(),
         )
-        ship_to_city = str(_row_get_any(ship_row, "shipToCity") or first.get("city") or "").strip()
-        ship_to_state = self._ship_to_state_code(ship_row, str(first.get("state") or ""))
+        ship_to_city = str(_row_get_any(so_row, "shipToCity") or first.get("city") or "").strip()
+        ship_to_state = self._ship_to_state_code(so_row, str(first.get("state") or ""))
         ship_to_postal_code = str(
-            _row_get_any(ship_row, "shipToZip", "shipToPostalCode") or first.get("zip") or ""
+            _row_get_any(so_row, "shipToZip", "shipToPostalCode") or first.get("zip") or ""
         ).strip()
         if not all([ship_to_address_1, ship_to_city, ship_to_state, ship_to_postal_code]):
             messagebox.showerror(

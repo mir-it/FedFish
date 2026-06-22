@@ -3,38 +3,19 @@ PACKED_STATUS_ID = 20
 
 SHIPMENTS_SQL = f"""
 SELECT
-    so.num AS ship_num,
+    so.num AS so_num,
     so.*,
-    COALESCE(ship.shipToCity, '') AS city,
+    COALESCE(so.shipToCity, '') AS city,
     COALESCE(stateconst.code, '') AS state,
-    COALESCE(ship.shipToZip, '') AS zip,
-    shipcarton.freightweight AS weight,
-    shipcarton.len AS length,
-    shipcarton.width AS width,
-    shipcarton.height AS height,
-    (
-        SELECT c.name
-        FROM shipcarton sc
-        LEFT JOIN carrier c ON c.id = sc.carrierId
-        WHERE sc.shipId = ship.id
-        ORDER BY sc.id
-        LIMIT 1
-    ) AS carrier_name,
+    COALESCE(so.shipToZip, '') AS zip,
+    COALESCE(carrier.name, '') AS carrier_name,
     COALESCE(customer.name, '') AS customer_name,
     lg.name AS location_group
 FROM so
 JOIN locationgroup lg ON so.locationGroupId = lg.id
 LEFT JOIN customer ON customer.id = so.customerId
-LEFT JOIN ship ON ship.id = (
-    SELECT s.id
-    FROM ship s
-    WHERE s.soId = so.id
-      AND s.statusId = {PACKED_STATUS_ID}
-    ORDER BY s.id DESC
-    LIMIT 1
-)
-LEFT JOIN shipcarton ON ship.id = shipcarton.shipId
-LEFT JOIN stateconst ON ship.shipToStateId = stateconst.id
+LEFT JOIN carrier ON carrier.id = so.carrierId
+LEFT JOIN stateconst ON so.shipToStateId = stateconst.id
 WHERE EXISTS (
     SELECT 1
     FROM ship sx
@@ -47,29 +28,16 @@ ORDER BY so.num
 
 SHIPMENT_ITEMS_SQL_TEMPLATE = f"""
 SELECT
+    so.num AS so_num,
     ship.num AS ship_num,
     so.customerPO AS po_number,
-    ship.shipToName AS ship_to_name,
-    ship.shipToAddress AS address_1,
-    ship.shipToCity AS city,
+    so.shipToName AS ship_to_name,
+    so.shipToAddress AS address_1,
+    so.shipToCity AS city,
     stateconst.code AS state,
-    ship.shipToZip AS zip,
+    so.shipToZip AS zip,
+    COALESCE(carrier.name, '') AS carrier_name,
     product.num AS item_num,
-    (
-        SELECT sc.carrierId
-        FROM shipcarton sc
-        WHERE sc.shipId = ship.id
-        ORDER BY sc.id
-        LIMIT 1
-    ) AS carrier_id,
-    (
-        SELECT c.name
-        FROM shipcarton sc
-        LEFT JOIN carrier c ON c.id = sc.carrierId
-        WHERE sc.shipId = ship.id
-        ORDER BY sc.id
-        LIMIT 1
-    ) AS carrier_name,
     COALESCE(
         (
             SELECT ttv.info
@@ -89,45 +57,31 @@ SELECT
 FROM ship
 JOIN so ON ship.soId = so.id
 JOIN locationgroup lg ON so.locationGroupId = lg.id
-JOIN stateconst ON ship.shipToStateId = stateconst.id
+LEFT JOIN carrier ON carrier.id = so.carrierId
+LEFT JOIN stateconst ON so.shipToStateId = stateconst.id
 JOIN shipitem ON shipitem.shipId = ship.id
 JOIN soitem ON soitem.id = shipitem.soItemId
 JOIN product ON soitem.productId = product.id
 JOIN uom ON soitem.uomId = uom.id
 WHERE ship.statusId = {PACKED_STATUS_ID}
   AND lg.name = '{LOCATION_GROUP}'
-  AND so.num = '{{ship_num}}'
+  AND so.num = '{{so_num}}'
 ORDER BY product.num
 """
 
 
-def items_sql_for(ship_num: str) -> str:
-    safe = ship_num.replace("'", "''")
-    return SHIPMENT_ITEMS_SQL_TEMPLATE.format(ship_num=safe)
-
-
-SHIP_SQL_TEMPLATE = """
-SELECT
-    ship.*,
-    cs.name AS carrier_service_name
-FROM ship
-LEFT JOIN carrierservice cs ON cs.id = ship.carrierServiceId
-WHERE soId = (
-    SELECT id
-    FROM so
-    WHERE num = '{ship_num}'
-    LIMIT 1
-)
-  AND statusId = {PACKED_STATUS_ID}
-ORDER BY id DESC
-LIMIT 1
-"""
+def items_sql_for(so_num: str) -> str:
+    safe = so_num.replace("'", "''")
+    return SHIPMENT_ITEMS_SQL_TEMPLATE.format(so_num=safe)
 
 
 SO_SQL_TEMPLATE = """
-SELECT *
+SELECT
+    so.*,
+    cs.name AS carrier_service_name
 FROM so
-WHERE num = '{ship_num}'
+LEFT JOIN carrierservice cs ON cs.id = so.carrierServiceId
+WHERE so.num = '{so_num}'
 LIMIT 1
 """
 
@@ -148,14 +102,9 @@ LIMIT 1
 """
 
 
-def ship_sql_for(ship_num: str) -> str:
-    safe = ship_num.replace("'", "''")
-    return SHIP_SQL_TEMPLATE.format(ship_num=safe, PACKED_STATUS_ID=PACKED_STATUS_ID)
-
-
-def so_sql_for(ship_num: str) -> str:
-    safe = ship_num.replace("'", "''")
-    return SO_SQL_TEMPLATE.format(ship_num=safe)
+def so_sql_for(so_num: str) -> str:
+    safe = so_num.replace("'", "''")
+    return SO_SQL_TEMPLATE.format(so_num=safe)
 
 
 def customer_sql_for(customer_id: int) -> str:
