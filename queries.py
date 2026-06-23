@@ -4,18 +4,32 @@ PACKED_STATUS_ID = 20
 SHIPMENTS_SQL = f"""
 SELECT
     so.num AS so_num,
-    so.*,
-    COALESCE(so.shipToCity, '') AS city,
-    COALESCE(stateconst.code, '') AS state,
-    COALESCE(so.shipToZip, '') AS zip,
+    so.customerPO,
+    so.shipToName,
+    so.shipToAddress,
+    so.shipToCity,
+    so.shipToStateId,
+    so.shipToZip,
+    so.billToName,
+    so.billToAddress,
+    so.billToCity,
+    so.billToStateId,
+    so.billToZip,
+    so.note,
+    so.dateFirstShip,
     COALESCE(carrier.name, '') AS carrier_name,
+    COALESCE(cs.name, '') AS carrier_service_name,
     COALESCE(customer.name, '') AS customer_name,
+    COALESCE(ship_state.code, '') AS ship_to_state,
+    COALESCE(bill_state.code, '') AS bill_to_state,
     lg.name AS location_group
 FROM so
 JOIN locationgroup lg ON so.locationGroupId = lg.id
 LEFT JOIN customer ON customer.id = so.customerId
 LEFT JOIN carrier ON carrier.id = so.carrierId
-LEFT JOIN stateconst ON so.shipToStateId = stateconst.id
+LEFT JOIN carrierservice cs ON cs.id = so.carrierServiceId
+LEFT JOIN stateconst ship_state ON so.shipToStateId = ship_state.id
+LEFT JOIN stateconst bill_state ON so.billToStateId = bill_state.id
 WHERE EXISTS (
     SELECT 1
     FROM ship sx
@@ -28,15 +42,6 @@ ORDER BY so.num
 
 SHIPMENT_ITEMS_SQL_TEMPLATE = f"""
 SELECT
-    so.num AS so_num,
-    ship.num AS ship_num,
-    so.customerPO AS po_number,
-    so.shipToName AS ship_to_name,
-    so.shipToAddress AS address_1,
-    so.shipToCity AS city,
-    stateconst.code AS state,
-    so.shipToZip AS zip,
-    COALESCE(carrier.name, '') AS carrier_name,
     product.num AS item_num,
     COALESCE(
         (
@@ -51,14 +56,11 @@ SELECT
     ) AS tracking,
     soitem.id AS order_index,
     COALESCE(soitem.note, '') AS soitem_note,
-    soitem.dateScheduledFulfillment AS date_scheduled_fulfillment,
     shipitem.qtyShipped AS qty,
     uom.code AS uom
 FROM ship
 JOIN so ON ship.soId = so.id
 JOIN locationgroup lg ON so.locationGroupId = lg.id
-LEFT JOIN carrier ON carrier.id = so.carrierId
-LEFT JOIN stateconst ON so.shipToStateId = stateconst.id
 JOIN shipitem ON shipitem.shipId = ship.id
 JOIN soitem ON soitem.id = shipitem.soItemId
 JOIN product ON soitem.productId = product.id
@@ -75,40 +77,12 @@ def items_sql_for(so_num: str) -> str:
     return SHIPMENT_ITEMS_SQL_TEMPLATE.format(so_num=safe)
 
 
-SO_SQL_TEMPLATE = """
-SELECT
-    so.*,
-    cs.name AS carrier_service_name
-FROM so
-LEFT JOIN carrierservice cs ON cs.id = so.carrierServiceId
-WHERE so.num = '{so_num}'
-LIMIT 1
-"""
-
-
-CUSTOMER_SQL_TEMPLATE = """
-SELECT *
-FROM customer
-WHERE id = {customer_id}
-LIMIT 1
-"""
-
-
 STATE_CODE_SQL_TEMPLATE = """
 SELECT code
 FROM stateconst
 WHERE id = {state_id}
 LIMIT 1
 """
-
-
-def so_sql_for(so_num: str) -> str:
-    safe = so_num.replace("'", "''")
-    return SO_SQL_TEMPLATE.format(so_num=safe)
-
-
-def customer_sql_for(customer_id: int) -> str:
-    return CUSTOMER_SQL_TEMPLATE.format(customer_id=int(customer_id))
 
 
 def state_code_sql_for(state_id: int) -> str:
