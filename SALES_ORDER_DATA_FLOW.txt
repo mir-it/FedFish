@@ -1,0 +1,399 @@
+FEDFISH — SALES ORDER & DATA FLOW REFERENCE
+=============================================
+
+Purpose
+-------
+FedFish is a desktop app (Python + Tkinter) that:
+  1. Lists packed Fishbowl sales orders ready to ship
+  2. Lets a user review/adjust line qty, lot numbers, and carrier fields
+  3. Creates the order in Synapse (WMS)
+
+Fishbowl is the source of truth for order data. Synapse receives a JSON payload built at send time.
+
+
+Project files (what each module does)
+-------------------------------------
+app.py              UI (shipments list, detail/review screen, buttons)
+sales_order.py      Domain model: SalesOrder, line aggregation, Synapse payload builder
+queries.py          Fishbowl SQL (list query + per-SO line query)
+fishbowl_client.py  Fishbowl REST login + data-query API
+synapse_client.py   Synapse REST login + create-order API
+carrier_resolvers.py  Carrier name -> SCAC, ship type, shipment terms, delivery service
+uom_conversion.py   SF -> EA conversion using local PRODUCT_COVERAGE_CSV
+config.py           Settings from .env (Fishbowl, Synapse, SMTP, filters)
+
+
+High-level data flow
+--------------------
+
+  [Fishbowl DB]
+       |
+       |  SHIPMENTS_SQL (1 query on Refresh)
+       v
+  App.cached_so_rows          — full Fishbowl row per SO (dict keyed by so_num)
+  App.order_summaries         — lightweight list rows for the tree view
+       |
+       |  User double-clicks an SO
+       v
+  items_sql_for(so_num) (1 query)
+       +
+  cached row for that SO (no second header query)
+       |
+       v
+  SalesOrderSession           — SalesOrder + optional last Synapse send debug data
+       |
+       |  aggregated_review_lines() + UI edits
+       v
+  PalletDetailFrame._review_rows   — qty, lot, UOM overrides (UI only, not on SalesOrder)
+       |
+       |  Create Synapse Order
+       v
+  SalesOrder.build_synapse_payload()
+       |
+       v
+  synapse_client.create_order()
+
+
+Step 1 — Shipments list (Refresh)
+---------------------------------
+Trigger: Shipments screen -> Refresh (also runs once after Fishbowl login if list is empty)
+
+Function: load_order_summaries(fb) in sales_order.py
+
+Fishbowl query: queries.SHIPMENTS_SQL
+  - Filters: location group = "Jersey City, NJ", shipment status = packed (statusId 20)
+  - Joins: customer, carrier, carrierservice, ship/bill state codes
+  - Returns one row per sales order with header-level fields (ship-to, bill-to, PO, carrier, dateFirstShip, etc.)
+
+Stored in App:
+  cached_so_rows[so_num]   = raw SQL row (used when opening detail)
+  order_summaries[so_num]  = SalesOrderSummary (columns shown in the list)
+
+Important: Opening an SO requires a cached row. If the user skips Refresh or the SO is not in the list, detail view shows a warning and goes back.
+
+
+Step 2 — Open sales order detail
+--------------------------------
+Trigger: User selects an SO from the list
+
+Function: SalesOrderSession.load(fb, so_num, so_row=cached_row, last_send_store=...)
+
+Fishbowl queries:
+  - Uses cached_so_rows[so_num] for all header fields (address, PO, carrier, ship date, states)
+  - items_sql_for(so_num) for line items only
+
+items_sql_for returns per packed line:
+  item_num, qty (qtyShipped), uom, tracking (lot from tagtrackingview), order_index (soitem.id), soitem_note
+
+Built object: SalesOrder
+  - Immutable-ish domain object (dataclass) holding Fishbowl fields + list[OrderLine]
+  - ship_to_state / bill_to_state come from SQL joins; falls back to state ID lookup only if missing
+
+Also loaded: SynapseLastSendStore applies last saved payload/response for this SO (debug only).
+
+
+Step 3 — Review UI (editable layer)
+-----------------------------------
+Location: PalletDetailFrame in app.py
+
+SalesOrder.aggregated_review_lines() merges Fishbowl lines by (item, uom, lot):
+  - Sums quantities
+  - Keeps first order_index as dtl_pass_thru_num_10
+  - Keeps first soitem_note per group
+  - Skips items matching EXCLUDE_ITEM_KEYWORDS (e.g. shipping, freight, fee)
+
+_build_synapse_review_rows() adds UI fields:
+  send_uom, send_qty (fallback), noted_qty (Send Qty column), lot_number, SF per EA note
+
+User edits live in _review_rows only. They are NOT written back to SalesOrder or Fishbowl.
+
+Carrier fields prefilled from:
+  - Fishbowl carrier name
+  - carrier_resolvers.py defaults
+  - CarrierPreferenceStore (learned from past successful sends)
+
+Order instructions (hdrinstruct):
+  - Default: line notes joined, else SO note (resolved_instructions)
+  - User can override in the instructions text box (stored in App.hdr_instructions_by_so)
+
+
+Step 4 — Send to Synapse
+------------------------
+Trigger: Create Synapse Order button
+
+Reads at click time:
+  - Header overrides from UI: SCAC, ship type, shipment terms, delivery service
+  - Line data from _review_rows (not from raw Fishbowl lines)
+  - Instructions from instructions text box
+
+Builds: session.order.build_synapse_payload(
+           header=SynapseHeaderOverrides(...),
+           details=[SynapseDetailLine(...), ...],
+           instructions=...,
+       )
+
+Key payload rules (sales_order.py):
+  - Requires PO, ship-to address/city/state/zip, dateFirstShip, at least one detail line
+  - reference = SO number without leading "S" if present
+  - ship_date from Fishbowl dateFirstShip
+  - bill-to block included only when shipment_terms = 3RD
+  - consignee code set for UPS/FedEx based on customer name
+  - Ecom HD / Ecom LS: special ship-to address split (first line -> address_2, rest -> address_1)
+  - Header fields truncated/uppercased per Synapse limits
+
+Send: synapse_client.create_order(order_data)
+
+After send (success or failure):
+  - session.record_synapse_send(payload, response, store=synapse_last_send)
+  - CarrierPreferenceStore remembers SCAC + ship type for that carrier name
+  - Sent SO marked in synapse_sent_shipments.txt (list shows SENT)
+
+
+Key classes in sales_order.py
+-----------------------------
+
+SalesOrderSummary
+  Lightweight row for the shipments list tree (so_num, customer, city, state, zip, carrier).
+
+OrderLine
+  One packed Fishbowl line: item_num, qty, uom, tracking (lot), order_index, soitem_note.
+
+SalesOrder
+  Full order loaded for one SO. Methods:
+    load(fb, so_num, so_row=...)     Build from cached row + items query
+    aggregated_review_lines(...)    Merge lines for review grid
+    resolved_instructions(...)      Manual override or line notes or SO note
+    build_synapse_payload(...)      Fishbowl + UI overrides -> Synapse JSON
+    email_item_lines()              For BOL email body
+
+SynapseHeaderOverrides / SynapseDetailLine
+  Small structs passed into build_synapse_payload for UI-controlled Synapse fields.
+
+SalesOrderSession
+  Wraps SalesOrder for one open SO in the app.
+  Holds synapse_payload / synapse_response for Show payload debug view.
+  record_synapse_send(...) updates session and optionally persists to disk.
+
+SynapseLastSendStore
+  Loads/saves synapse_last_send_map.txt (one tab-separated JSON record per SO).
+
+
+What is NOT stored on SalesOrder
+--------------------------------
+These exist only in the UI layer (app.py):
+  - Send Qty / Fallback Qty / edited Lot #
+  - SCAC, ship type, shipment terms, delivery service dropdowns
+  - Order instructions text box override
+
+If debugging "wrong qty sent", check _review_rows and the send button handler, not SalesOrder.lines.
+
+
+Local persistence files (per machine, in .gitignore)
+----------------------------------------------------
+.env                          Secrets and settings (not committed)
+synapse_sent_shipments.txt    SO numbers successfully sent to Synapse
+synapse_last_send_map.txt     Last payload + response per SO (Show payload debug)
+carrier_scac_map.txt          Remembered carrier -> SCAC
+carrier_ship_type_map.txt     Remembered carrier -> ship type
+PRODUCT_COVERAGE_CSV          Optional local file for SF->EA conversion
+
+
+Environment variables (config.py)
+---------------------------------
+Fishbowl:   FB_HOST, FB_PORT, FB_USERNAME, FB_PASSWORD
+Synapse:    SYNAPSE_BASE_URL, SYNAPSE_USERNAME, SYNAPSE_PASSWORD,
+            SYNAPSE_CUSTID, SYNAPSE_FROM_FACILITY, SYNAPSE_SHIP_TYPE,
+            SYNAPSE_SHIPMENT_TERMS, SYNAPSE_REQUIRE_LOT
+Filtering:  EXCLUDE_ITEM_KEYWORDS
+UOM:        PRODUCT_COVERAGE_CSV
+Email BOL:  SMTP_*, NJ_WAREHOUSE_EMAIL, NJ_WAREHOUSE_CC
+
+
+Common debug scenarios
+----------------------
+
+List is slow or empty
+  - Check Fishbowl connection and SHIPMENTS_SQL filters (location group, packed status)
+  - List should be ONE query; state codes come from SQL joins, not per-row lookups
+
+"Cached sales-order row missing" when opening SO
+  - User must Refresh list first; SO must appear in current query results
+
+Wrong state on list vs detail
+  - Both should use ship_to_state from SHIPMENTS_SQL; detail only hits state_code_sql if join returned blank
+
+Lot number missing in Synapse
+  - Source: tagtrackingview via shipitem.tagId in items SQL
+  - UI normalizes lot in _normalize_lot_number before send
+  - SYNAPSE_REQUIRE_LOT=Y blocks send if lot is empty
+
+Qty wrong
+  - Trace: Fishbowl qty -> aggregated_review_lines -> SF/EA conversion -> _review_rows -> SynapseDetailLine
+
+Show payload empty
+  - Before send: needs valid review rows + header fields (draft preview)
+  - After send: synapse_last_send_map.txt for that SO
+
+Synapse field rejected
+  - Check _apply_header_field_limits in sales_order.py for max lengths
+  - Check synapse_client.py for required fields and date format
+
+
+Terminology note
+----------------
+"Cached SO row" = the dict from SHIPMENTS_SQL stored in App.cached_so_rows.
+This is Fishbowl header data from the list query, not the Synapse JSON "header" block.
+The Synapse payload "header" is built later by build_synapse_payload().
+
+
+Chapter — Email PDF to NJ (BOL attachments)
+===========================================
+
+Overview
+--------
+The "Email PDF to NJ" button on the sales order detail screen sends one or more PDF
+files (typically BOL documents) to the warehouse by email. It does not upload to
+Synapse or Fishbowl. The app uses standard SMTP with STARTTLS (Gmail-compatible).
+
+Button location: order detail screen, next to "Create Synapse Order".
+Code: app.py -> _email_bol_to_warehouse(), _open_bol_email_dialog(), _send_pdf_email()
+
+
+.env variables for email
+------------------------
+
+Required to send at all:
+  SMTP_USERNAME     Google (or other) account used to log in and send mail
+  SMTP_PASSWORD     App password for that account (NOT your normal Google password)
+  NJ_WAREHOUSE_EMAIL   Default "To" recipient (warehouse inbox)
+
+Optional:
+  SMTP_FROM         "From" address shown on the email. If blank, SMTP_USERNAME is used.
+  SMTP_HOST         Mail server (default: smtp.gmail.com)
+  SMTP_PORT         Port (default: 587)
+  NJ_WAREHOUSE_CC   Default Cc list. Comma or semicolon separated.
+
+Example .env (Gmail sender, warehouse recipient, one CC):
+
+  SMTP_HOST=smtp.gmail.com
+  SMTP_PORT=587
+  SMTP_USERNAME=shipping@yourcompany.com
+  SMTP_PASSWORD=abcd efgh ijkl mnop
+  SMTP_FROM=shipping@yourcompany.com
+  NJ_WAREHOUSE_EMAIL=warehouse@yourcompany.com
+  NJ_WAREHOUSE_CC=manager@yourcompany.com, logistics@yourcompany.com
+
+Restart the app after changing .env. Values are read once at startup.
+
+
+Who sends, who receives, who is CC'd
+-------------------------------------
+
+  From (sender)
+    Set by SMTP_FROM, or SMTP_USERNAME if SMTP_FROM is empty.
+    The SMTP login must match an account allowed to send as that address.
+
+  To (recipient)
+    Fixed from NJ_WAREHOUSE_EMAIL. Shown read-only in the send dialog.
+    To email a different warehouse, change NJ_WAREHOUSE_EMAIL in .env and restart.
+    (There is no per-send To override in the UI.)
+
+  Cc
+    Pre-filled from NJ_WAREHOUSE_CC in .env.
+    Editable in the send dialog before clicking Send.
+    Separate multiple addresses with comma or semicolon.
+
+  Subject and body
+    Pre-filled from the current sales order (SO number, carrier, item list).
+    Fully editable in the send dialog before Send.
+
+
+Google App Password (required for Gmail / Google Workspace)
+-------------------------------------------------------------
+
+Google blocks normal account passwords for SMTP. Use a 16-character App Password.
+
+Prerequisites:
+  - 2-Step Verification must be ON for the Google account.
+
+Steps:
+  1. Sign in at https://myaccount.google.com
+  2. Security -> 2-Step Verification (enable if not already)
+  3. Security -> App passwords
+     (Or search "App passwords" in Google Account settings)
+  4. Select app: Mail (or Other -> name it e.g. "FedFish")
+  5. Select device: Windows Computer (or Other)
+  6. Click Generate
+  7. Copy the 16-character password (shown with spaces)
+  8. Paste into .env as SMTP_PASSWORD (spaces are OK)
+
+Use the full Gmail address for SMTP_USERNAME (e.g. user@gmail.com or user@yourdomain.com
+for Google Workspace).
+
+If App passwords is missing:
+  - Confirm 2-Step Verification is enabled
+  - Workspace admins may need to allow app passwords for the org
+
+
+How the button works (step by step)
+-----------------------------------
+
+  1. User opens a sales order on the detail screen.
+
+  2. User clicks "Email PDF to NJ".
+
+  3. App checks NJ_WAREHOUSE_EMAIL, SMTP_USERNAME, and SMTP_PASSWORD.
+     Shows an error if any required value is missing.
+
+  4. File picker opens. User selects one or more PDF files from disk.
+     Cancel closes without sending.
+
+  5. Send dialog opens with:
+       To:     NJ_WAREHOUSE_EMAIL (read-only)
+       Cc:     from NJ_WAREHOUSE_CC (editable)
+       Subject: "NJ - New Order # {SO number}"
+       Body:   greeting + carrier from Fishbowl + item list from order lines
+       Attachments: file names of selected PDFs
+
+     Item list in the body comes from SalesOrder.email_item_lines()
+     (item numbers and line notes from Fishbowl, deduplicated).
+
+  6. User edits Cc / subject / body if needed, then clicks Send.
+
+  7. App sends in a background thread via _send_pdf_email():
+       - Connects to SMTP_HOST:SMTP_PORT
+       - STARTTLS, then login with SMTP_USERNAME / SMTP_PASSWORD
+       - Builds email with PDF attachments
+       - Delivers to To + all Cc addresses
+
+  8. Success: status bar message + confirmation dialog.
+     Failure: error dialog with SMTP error details (bad password, network, etc.)
+
+
+Email troubleshooting
+---------------------
+
+  "Email not configured" / "Warehouse email not set"
+    Add missing variables to .env and restart.
+
+  Authentication failed (535 / Invalid credentials)
+    Use an App Password, not the normal Google password.
+    Regenerate the app password if it was revoked.
+
+  Email sends but warehouse does not receive it
+    Check spam. Confirm NJ_WAREHOUSE_EMAIL is correct.
+    For Google Workspace, admin may restrict SMTP relay.
+
+  Want a different sender account
+    Change SMTP_USERNAME, SMTP_PASSWORD, and optionally SMTP_FROM in .env.
+
+  Want a different default warehouse inbox
+    Change NJ_WAREHOUSE_EMAIL in .env (restart required).
+
+  Want standing CC recipients on every email
+    Set NJ_WAREHOUSE_CC in .env. User can still add/remove Cc in the dialog.
+
+  Non-Gmail SMTP
+    Set SMTP_HOST and SMTP_PORT for your provider. STARTTLS on port 587 is assumed.
+    Provider must allow SMTP auth from desktop apps.
+

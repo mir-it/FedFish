@@ -38,9 +38,12 @@ def _synapse_reference_from_so_num(raw_so_num) -> str:
     return so_num
 
 
+_ECOM_SPLIT_ADDRESS_CUSTOMERS = frozenset({"Ecom HD", "Ecom LS"})
+
+
 def _split_ship_to_address(raw: str, customer_name: str = "") -> tuple[str, str]:
     text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    if str(customer_name or "").strip() != "Ecom HD":
+    if str(customer_name or "").strip() not in _ECOM_SPLIT_ADDRESS_CUSTOMERS:
         return " ".join(line.strip() for line in text.split("\n") if line.strip()), ""
     if "\n" not in text:
         return text, ""
