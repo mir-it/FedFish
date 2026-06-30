@@ -3,6 +3,7 @@ import queue
 import re
 import smtplib
 import threading
+import time
 import tkinter as tk
 from email.message import EmailMessage
 from pathlib import Path
@@ -33,9 +34,16 @@ from sales_order import (
     SynapseLastSendStore,
     load_order_summaries,
 )
-from fishbowl_client import FishbowlClient
+from fishbowl_client import FishbowlAuthError, FishbowlClient
 from synapse_client import SynapseClient, SynapseConfig, SynapseCreateOrderError
 from uom_conversion import load_coverage_map_from_csv, normalize_uom, suggest_each_qty
+
+
+def _safe_logout(client: "FishbowlClient") -> None:
+    try:
+        client.logout()
+    except Exception:
+        pass
 
 
 def _send_pdf_email(to_addr: str, subject: str, body: str, attachment_paths, cc_addrs=None):
@@ -127,6 +135,68 @@ def _parse_noted_qty(text: str):
 
 SENT_SHIPMENTS_FILE = Path(__file__).with_name("synapse_sent_shipments.txt")
 
+INACTIVITY_SECONDS = 15 * 60
+IDLE_CHECK_MS = 60_000
+
+
+class LoginFrame(ttk.Frame):
+    def __init__(self, parent, app: "App"):
+        super().__init__(parent)
+        self.app = app
+
+        outer = ttk.Frame(self, padding=40)
+        outer.place(relx=0.5, rely=0.4, anchor="center")
+
+        ttk.Label(outer, text="Fishbowl Login", font=("TkDefaultFont", 16, "bold")).grid(
+            row=0, column=0, columnspan=2, pady=(0, 20)
+        )
+
+        self.host_var = tk.StringVar(value=config.FB_HOST)
+        self.port_var = tk.StringVar(value=config.FB_PORT)
+        self.username_var = tk.StringVar(value=config.FB_USERNAME)
+        self.password_var = tk.StringVar(value=config.FB_PASSWORD)
+
+        fields = [
+            ("Host:", self.host_var),
+            ("Port:", self.port_var),
+            ("Username:", self.username_var),
+            ("Password:", self.password_var),
+        ]
+        for i, (label, var) in enumerate(fields, start=1):
+            ttk.Label(outer, text=label).grid(row=i, column=0, sticky="e", padx=(0, 10), pady=6)
+            show = "*" if label == "Password:" else None
+            entry = ttk.Entry(outer, textvariable=var, width=32, show=show)
+            entry.grid(row=i, column=1, sticky="w", pady=6)
+            if i == 1:
+                self._first_entry = entry
+
+        self.login_btn = ttk.Button(outer, text="Login", command=self._do_login)
+        self.login_btn.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(20, 0))
+
+        self.bind("<Return>", lambda e: self._do_login())
+
+    def on_show(self):
+        self.login_btn.config(state="normal")
+        self._first_entry.focus_set()
+
+    def _do_login(self):
+        host = self.host_var.get().strip()
+        port = self.port_var.get().strip()
+        username = self.username_var.get().strip()
+        password = self.password_var.get()
+        if not host or not port or not username or not password:
+            messagebox.showwarning("Missing fields", "Enter host, port, username, and password.")
+            return
+        self.login_btn.config(state="disabled")
+        self.app.connect_fishbowl(
+            host,
+            port,
+            username,
+            password,
+            on_success=lambda: self.app.show("shipments"),
+            on_failure=lambda: self.login_btn.config(state="normal"),
+        )
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -158,6 +228,7 @@ class App(tk.Tk):
 
         self.frames: dict[str, ttk.Frame] = {}
         for name, cls in [
+            ("login", LoginFrame),
             ("shipments", ShipmentsFrame),
             ("detail", PalletDetailFrame),
         ]:
@@ -165,8 +236,11 @@ class App(tk.Tk):
             self.frames[name] = frame
             frame.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-        self.show("shipments")
-        self.connect_fishbowl()
+        self._last_activity = time.monotonic()
+        self._idle_timer_id: str | None = None
+        self._bind_activity_tracking()
+
+        self.show("login")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -179,16 +253,18 @@ class App(tk.Tk):
     def set_status(self, text: str):
         self.status_var.set(text)
 
-    def connect_fishbowl(self, on_success=None):
+    def connect_fishbowl(self, host, port, username, password, on_success=None, on_failure=None):
         self.set_status("Connecting to Fishbowl...")
-        client = FishbowlClient(config.FB_HOST, config.FB_PORT)
+        client = FishbowlClient(host, port)
 
         def do():
-            client.login(config.FB_USERNAME, config.FB_PASSWORD)
+            client.login(username, password)
             return client
 
         def ok(connected_client):
             self.fb = connected_client
+            self._last_activity = time.monotonic()
+            self._start_idle_monitor()
             self.set_status("Connected.")
             shipments = self.frames.get("shipments")
             if isinstance(shipments, ShipmentsFrame) and not shipments.tree.get_children():
@@ -199,8 +275,61 @@ class App(tk.Tk):
         def err(exc):
             self.set_status(f"Login failed: {exc}")
             messagebox.showerror("Fishbowl login failed", str(exc))
+            if on_failure:
+                on_failure()
 
         self.run_async(do, ok, err)
+
+    def logout(self, show_message: str | None = None):
+        self._stop_idle_monitor()
+        client = self.fb
+        self.fb = None
+        self.order_summaries.clear()
+        self.cached_so_rows.clear()
+        self.current_so_num = None
+        self.current_order = None
+        shipments = self.frames.get("shipments")
+        if isinstance(shipments, ShipmentsFrame):
+            shipments.clear_view()
+        self.set_status("Logged out.")
+        self.show("login")
+        if show_message:
+            messagebox.showinfo("Session ended", show_message)
+        if client and client.token:
+            threading.Thread(target=_safe_logout, args=(client,), daemon=True).start()
+
+    def _handle_auth_error(self, exc):
+        self.set_status("Session expired. Please log in again.")
+        self.logout()
+
+    def _bind_activity_tracking(self):
+        def record(_event=None):
+            if self.fb:
+                self._last_activity = time.monotonic()
+
+        for seq in ("<Button-1>", "<Button-2>", "<Button-3>", "<Key>"):
+            self.bind_all(seq, record, add="+")
+
+    def _start_idle_monitor(self):
+        self._stop_idle_monitor()
+        self._schedule_idle_check()
+
+    def _stop_idle_monitor(self):
+        if self._idle_timer_id is not None:
+            self.after_cancel(self._idle_timer_id)
+            self._idle_timer_id = None
+
+    def _schedule_idle_check(self):
+        self._idle_timer_id = self.after(IDLE_CHECK_MS, self._check_idle)
+
+    def _check_idle(self):
+        self._idle_timer_id = None
+        if not self.fb:
+            return
+        if time.monotonic() - self._last_activity >= INACTIVITY_SECONDS:
+            self.logout()
+            return
+        self._schedule_idle_check()
 
     def run_async(self, fn, on_success, on_error=None):
         q: queue.Queue = queue.Queue()
@@ -222,6 +351,9 @@ class App(tk.Tk):
             if kind == "ok":
                 on_success(payload)
             else:
+                if isinstance(payload, FishbowlAuthError):
+                    self._handle_auth_error(payload)
+                    return
                 if on_error:
                     on_error(payload)
                 else:
@@ -231,6 +363,7 @@ class App(tk.Tk):
         self.after(100, poll)
 
     def _on_close(self):
+        self._stop_idle_monitor()
         if self.fb and self.fb.token:
             try:
                 self.fb.logout()
@@ -272,6 +405,7 @@ class ShipmentsFrame(ttk.Frame):
         self.ship_search_entry.pack(side="left")
         self.ship_search_var.trace_add("write", lambda *_: self._render_shipments())
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
+        ttk.Button(top, text="Logout", command=self._logout).pack(side="right", padx=(0, 8))
 
         cols = ("so_num", "customer", "city", "state", "zip", "carrier", "synapse_status")
         headers = ("SO #", "Customer", "City", "State", "Zip", "Carrier", "Synapse")
@@ -295,6 +429,15 @@ class ShipmentsFrame(ttk.Frame):
     def on_show(self):
         if self.app.fb and not self.tree.get_children():
             self.refresh()
+
+    def clear_view(self):
+        self._all_shipment_rows = []
+        self.ship_search_var.set("")
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+    def _logout(self):
+        self.app.logout()
 
     def _on_shipments_tree_right_click(self, event):
         row_id = self.tree.identify_row(event.y)
@@ -331,6 +474,8 @@ class ShipmentsFrame(ttk.Frame):
             return load_order_summaries(self.app.fb)
 
         def ok(result):
+            if self.app.fb is None:
+                return
             summaries, cached_so_rows = result
             self.app.order_summaries = {s.so_num: s for s in summaries if s.so_num}
             self.app.cached_so_rows = cached_so_rows

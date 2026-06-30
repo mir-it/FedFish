@@ -7,6 +7,11 @@ class FishbowlError(Exception):
     pass
 
 
+class FishbowlAuthError(FishbowlError):
+    """Raised when the server rejects the token (expired/invalid session)."""
+    pass
+
+
 class FishbowlClient:
     def __init__(self, host: str, port: str, timeout: int = 30):
         self.base_url = f"http://{host}:{port}/api"
@@ -49,6 +54,9 @@ class FishbowlClient:
             headers=headers,
             timeout=self.timeout,
         )
+        if resp.status_code in (401, 403):
+            self.token = None
+            raise FishbowlAuthError(f"Session expired or unauthorized ({resp.status_code}).")
         if resp.status_code != 200:
             raise FishbowlError(f"data-query failed ({resp.status_code}): {resp.text}")
         try:
