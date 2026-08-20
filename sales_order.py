@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -39,6 +40,20 @@ def _synapse_reference_from_so_num(raw_so_num) -> str:
 
 
 _ECOM_SPLIT_ADDRESS_CUSTOMERS = frozenset({"Ecom HD", "Ecom LS"})
+
+# Fishbowl free-text address fields sometimes include emails; Synapse/carriers reject those.
+_EMAIL_IN_TEXT_RE = re.compile(
+    r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_emails_from_address(text: str) -> str:
+    """Remove email addresses from address text and tidy leftover whitespace/punctuation."""
+    cleaned = _EMAIL_IN_TEXT_RE.sub(" ", str(text or ""))
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s*,\s*,+", ",", cleaned)
+    return cleaned.strip(" ,;\t")
 
 
 def _split_ship_to_address(raw: str, customer_name: str = "") -> tuple[str, str]:
@@ -325,6 +340,8 @@ class SalesOrder:
             self.ship_to_address_raw,
             self.customer_name,
         )
+        ship_to_address_1 = _strip_emails_from_address(ship_to_address_1)
+        ship_to_address_2 = _strip_emails_from_address(ship_to_address_2)
         shipment_terms = normalize_terms(header.shipment_terms) or (
             config.SYNAPSE_SHIPMENT_TERMS or ""
         ).strip().upper()
@@ -370,7 +387,7 @@ class SalesOrder:
             order_data["header"].update(
                 {
                     "bill_to_name": self.bill_to_name,
-                    "bill_to_address_1": self.bill_to_address_1,
+                    "bill_to_address_1": _strip_emails_from_address(self.bill_to_address_1),
                     "bill_to_city": self.bill_to_city,
                     "bill_to_state": self.bill_to_state,
                     "bill_to_postal_code": self.bill_to_postal_code,
