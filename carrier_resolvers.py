@@ -22,6 +22,10 @@ SHIP_TYPE_BY_CARRIER_NAME_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 VALID_SHIP_TYPES: set[str] = {"A", "C", "L", "P", "R", "S", "T"}
 
+# Customer hasn't picked whose account to ship on yet; we quote weight/dims as Ground.
+# Pinned so a one-off manual pick (e.g. LTL) never becomes the remembered default.
+WILL_ADVISE_SHIP_TYPE = "S"
+
 SHIP_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("A", "Air"),
     ("C", "Sea"),
@@ -166,6 +170,10 @@ def is_ups_carrier(raw_name: str) -> bool:
 
 def is_fedex_carrier(raw_name: str) -> bool:
     return "fedex" in str(raw_name or "").strip().lower()
+
+
+def is_will_advise_carrier(raw_name: str) -> bool:
+    return bool(re.search(r"\bwill[\s\-_]*advise\b", str(raw_name or "").strip().lower()))
 
 
 def ship_type_from_carrier_name(raw_name: str) -> str:
@@ -350,6 +358,8 @@ class CarrierPreferenceStore:
         )
 
     def resolve_ship_type(self, carrier_name: str) -> str:
+        if is_will_advise_carrier(carrier_name):
+            return WILL_ADVISE_SHIP_TYPE
         carrier_norm = normalize_carrier_name(carrier_name)
         if carrier_norm and carrier_norm in self._ship_type_by_carrier:
             return self._ship_type_by_carrier[carrier_norm]
@@ -357,6 +367,8 @@ class CarrierPreferenceStore:
         return resolved if resolved in VALID_SHIP_TYPES else config.SYNAPSE_SHIP_TYPE
 
     def remember_ship_type(self, carrier_name: str, ship_type: str) -> None:
+        if is_will_advise_carrier(carrier_name):
+            return
         carrier_norm = normalize_carrier_name(carrier_name)
         ship_type_norm = str(ship_type or "").strip().upper()
         if not carrier_norm or ship_type_norm not in VALID_SHIP_TYPES:
